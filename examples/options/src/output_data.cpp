@@ -33,6 +33,10 @@ output_data::output_data(traccc::data_format f, std::string_view d)
     m_desc.add_options()("output-directory",
                          po::value(&directory)->default_value(directory),
                          "Directory to store the output files");
+    m_desc.add_options()("dump-ambiguity-input",
+                         po::value(&dump_ambiguity_input)->default_value(""),
+                         "Dump track candidates (ambiguity-resolution input) to "
+                         "JSON file before resolution");
 }
 
 void output_data::read(const boost::program_options::variables_map& vm) {

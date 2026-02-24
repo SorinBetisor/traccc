@@ -14,6 +14,9 @@ traccc_add_executable( seq_example "seq_example.cpp"
    traccc::performance traccc::options detray::detectors detray::io
    traccc_examples_common )
 
+traccc_add_executable( benchmark_resolver "benchmark_resolver.cpp"
+   LINK_LIBRARIES vecmem::core traccc::core traccc::io )
+
 traccc_add_executable( truth_finding_example "truth_finding_example.cpp"
    LINK_LIBRARIES vecmem::core detray::detectors traccc::core traccc::io
    traccc::performance traccc::options traccc_examples_common )
