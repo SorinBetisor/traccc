@@ -40,3 +40,4 @@
 # Build system related files.
 CMakeUserPresets.json
 out/
+build/
