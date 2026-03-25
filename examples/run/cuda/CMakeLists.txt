@@ -15,6 +15,10 @@ traccc_add_executable( seq_example_cuda "seq_example_cuda.cpp"
                   traccc::core traccc::device_common traccc::cuda_utils traccc::cuda
                   traccc::options detray::detectors detray::io
                   traccc_examples_common )
+
+traccc_add_executable( benchmark_resolver_cuda "benchmark_resolver_cuda.cpp"
+   LINK_LIBRARIES vecmem::core vecmem::cuda traccc::core traccc::io
+                  traccc::device_common traccc::cuda_utils traccc::cuda )
 traccc_add_executable( seeding_example_cuda "seeding_example_cuda.cpp"
    LINK_LIBRARIES vecmem::core vecmem::cuda traccc::io traccc::performance
                   traccc::core traccc::device_common traccc::cuda_utils traccc::cuda
