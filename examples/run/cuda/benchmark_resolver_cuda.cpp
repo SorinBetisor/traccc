@@ -1,9 +1,4 @@
-/** TRACCC library, part of the ACTS project (R&D line)
- *
- * (c) 2025 CERN for the benefit of the ACTS project
- *
- * Mozilla Public License Version 2.0
- *
+/**
  * GPU resolver benchmark harness.
  * Matches the output format of benchmark_resolver.cpp (CPU) so results can be
  * compared directly.  Extra fields: backend=gpu, time_h2d_ms, time_d2h_ms,
@@ -24,6 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <numeric>
 #include <optional>
@@ -100,7 +96,8 @@ std::string compute_hash_buffer(
     const traccc::edm::measurement_collection<
         traccc::default_algebra>::const_device meas{buf.measurements};
     std::vector<std::vector<traccc::measurement_id_type>> patterns;
-    for (std::size_t i = 0; i < dev.tracks.size(); ++i) {
+    for (std::uint32_t i = 0;
+         i < static_cast<std::uint32_t>(dev.tracks.size()); ++i) {
         std::vector<traccc::measurement_id_type> p;
         for (const auto& [type, idx] : dev.tracks.at(i).constituent_links()) {
             if (type == traccc::edm::track_constituent_link::measurement)
