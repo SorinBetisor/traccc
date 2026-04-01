@@ -22,6 +22,19 @@
 
 namespace traccc::cuda {
 
+/// Per-phase GPU timing data populated when set_profiling(true) is active.
+struct gpu_profile_data_t {
+    float filter_setup_ms    = 0.f;
+    float unique_meas_ms     = 0.f;
+    float inverted_index_ms  = 0.f;
+    float shared_count_ms    = 0.f;
+    float initial_sort_ms    = 0.f;
+    float eviction_loop_ms   = 0.f;
+    float output_copy_ms     = 0.f;
+    unsigned int eviction_graph_launches = 0u;
+    unsigned int unique_meas_count       = 0u;
+};
+
 /// Evicts tracks that seem to be duplicates or fakes. This algorithm takes a
 /// greedy approach in the sense that it will remove the track which looks "most
 /// duplicate/fake"
@@ -57,6 +70,13 @@ class greedy_ambiguity_resolution_algorithm
     /// Get configuration
     config_type& get_config() { return m_config; }
 
+    /// Enable per-phase CUDA event timing for the next operator() call.
+    void set_profiling(bool on) { m_profiling = on; }
+
+    /// Returns profiling data from the most recent operator() call.
+    /// Only valid after a call where set_profiling(true) was active.
+    const gpu_profile_data_t& last_profile() const { return m_last_profile; }
+
     private:
     /// Algorithm configuration
     config_type m_config;
@@ -68,6 +88,8 @@ class greedy_ambiguity_resolution_algorithm
     std::reference_wrapper<stream> m_stream;
     /// Warp size of the GPU being used
     unsigned int m_warp_size;
+    mutable bool               m_profiling{false};
+    mutable gpu_profile_data_t m_last_profile{};
 };
 
 }  // namespace traccc::cuda
