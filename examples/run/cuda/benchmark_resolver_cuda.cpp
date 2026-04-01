@@ -133,6 +133,7 @@ int main(int argc, char* argv[]) {
     std::string conflict_density = "med";
     std::size_t repeats  = 10;
     std::size_t warmup   = 3;
+    bool profile_mode    = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -148,6 +149,8 @@ int main(int argc, char* argv[]) {
             repeats = std::stoull(arg.substr(10));
         else if (arg.find("--warmup=") == 0)
             warmup = std::stoull(arg.substr(9));
+        else if (arg == "--profile")
+            profile_mode = true;
         else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "benchmark_resolver_cuda: GPU greedy ambiguity resolver benchmark\n"
@@ -157,6 +160,7 @@ int main(int argc, char* argv[]) {
                 << "  --conflict-density=   low|med|high (default med)\n"
                 << "  --repeats=N           Timed iterations (default 10)\n"
                 << "  --warmup=N            Warmup iterations (default 3)\n"
+                << "  --profile             Run one extra call with per-phase CUDA event timing\n"
                 << "\n"
                 << "Output fields (same as benchmark_resolver + GPU extras):\n"
                 << "  backend, n_candidates, n_selected, n_removed\n"
@@ -377,6 +381,25 @@ int main(int argc, char* argv[]) {
               << "cpu_hash="       << cpu_hash  << "\n"
               << "gpu_hash="       << gpu_hash  << "\n"
               << "hash_match="     << (hash_match ? "true" : "false") << "\n";
+
+    if (profile_mode) {
+        gpu_resolver.set_profiling(true);
+        gpu_resolver(device_input);
+        stream.synchronize();
+        gpu_resolver.set_profiling(false);
+
+        const traccc::cuda::gpu_profile_data_t& pd = gpu_resolver.last_profile();
+        std::cout << "profile_filter_setup_ms="          << pd.filter_setup_ms          << "\n"
+                  << "profile_unique_meas_ms="           << pd.unique_meas_ms           << "\n"
+                  << "profile_inverted_index_ms="        << pd.inverted_index_ms        << "\n"
+                  << "profile_shared_count_ms="          << pd.shared_count_ms          << "\n"
+                  << "profile_initial_sort_ms="          << pd.initial_sort_ms          << "\n"
+                  << "profile_eviction_loop_ms="         << pd.eviction_loop_ms         << "\n"
+                  << "profile_output_copy_ms="           << pd.output_copy_ms           << "\n"
+                  << "profile_eviction_graph_launches="  << pd.eviction_graph_launches  << "\n"
+                  << "profile_unique_meas_count="        << pd.unique_meas_count        << "\n"
+                  << "profile_hash_match="               << (hash_match ? "true" : "false") << "\n";
+    }
 
     return 0;
 }

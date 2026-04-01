@@ -25,6 +25,16 @@
 #include "traccc/cuda/ambiguity_resolution/greedy_ambiguity_resolution_algorithm.hpp"
 #include "traccc/definitions/math.hpp"
 
+// NVTX range helpers — zero overhead when no profiler is attached.
+#if __has_include("nvtx3/nvToolsExt.h")
+#    include "nvtx3/nvToolsExt.h"
+#    define AR_NVTX_PUSH(name) nvtxRangePushA(name)
+#    define AR_NVTX_POP()      nvtxRangePop()
+#else
+#    define AR_NVTX_PUSH(name) ((void)0)
+#    define AR_NVTX_POP()      ((void)0)
+#endif
+
 // Thrust include(s).
 #include <thrust/execution_policy.h>
 #include <thrust/extrema.h>
@@ -35,6 +45,38 @@
 #include <thrust/sort.h>
 #include <thrust/transform.h>
 #include <thrust/unique.h>
+namespace {
+
+/// Lightweight CUDA event set used for per-phase elapsed-time measurement.
+/// All events are created and destroyed inside operator() when profiling is on.
+struct PerfEvents {
+    cudaEvent_t ev[8]{};
+    bool active;
+
+    PerfEvents(bool on, cudaStream_t s) : active(on) {
+        if (!active) return;
+        for (auto& e : ev) cudaEventCreate(&e);
+        cudaEventRecord(ev[0], s);
+    }
+
+    ~PerfEvents() {
+        if (!active) return;
+        for (auto& e : ev) cudaEventDestroy(e);
+    }
+
+    void mark(int idx, cudaStream_t s) {
+        if (active) cudaEventRecord(ev[idx], s);
+    }
+
+    float elapsed(int a, int b) const {
+        float ms = 0.f;
+        if (active) cudaEventElapsedTime(&ms, ev[a], ev[b]);
+        return ms;
+    }
+};
+
+}  // namespace
+
 namespace traccc::cuda {
 
 struct identity_op {
@@ -124,6 +166,9 @@ greedy_ambiguity_resolution_algorithm::operator()(
         return {};
     }
 
+    PerfEvents perf(m_profiling, stream);
+    unsigned int n_graph_launches = 0u;
+
     // Make sure that max_shared_meas is largen than zero
     assert(m_config.max_shared_meas > 0u);
 
@@ -166,7 +211,7 @@ greedy_ambiguity_resolution_algorithm::operator()(
         const unsigned int nThreads = m_warp_size * 2;
         const unsigned int nBlocks = (n_tracks + nThreads - 1) / nThreads;
 
-        // Fill the vectors
+        AR_NVTX_PUSH("gpu_ar_filter_setup");
         kernels::fill_vectors<<<nBlocks, nThreads, 0, stream>>>(
             m_config, device::fill_vectors_payload{
                           .tracks_view = tracks_view,
@@ -178,6 +223,8 @@ greedy_ambiguity_resolution_algorithm::operator()(
         TRACCC_CUDA_ERROR_CHECK(cudaGetLastError());
 
         m_stream.get().synchronize();
+        AR_NVTX_POP();
+        perf.mark(1, stream);
     }
 
     // Count the number of pre-accepted tracks
@@ -208,6 +255,7 @@ greedy_ambiguity_resolution_algorithm::operator()(
     thrust::copy_if(thrust_policy, cit_begin, cit_end, status_buffer.ptr(),
                     pre_accepted_ids_buffer.ptr(), identity_op{});
 
+    AR_NVTX_PUSH("gpu_ar_unique_meas");
     // Sort the flat measurement id vector, which is required to count the
     // number of unique measurements
     thrust::sort(thrust_policy, flat_meas_ids_buffer.ptr(),
@@ -258,6 +306,9 @@ greedy_ambiguity_resolution_algorithm::operator()(
         TRACCC_CUDA_ERROR_CHECK(cudaGetLastError());
 
         m_stream.get().synchronize();
+        AR_NVTX_POP();
+        perf.mark(2, stream);
+        m_last_profile.unique_meas_count = meas_count;
     }
 
     // Retreive the counting vector to host for the size allocation of
@@ -294,6 +345,7 @@ greedy_ambiguity_resolution_algorithm::operator()(
                  n_accepted_tracks_per_measurement_buffer.ptr() + meas_count,
                  0);
 
+    AR_NVTX_PUSH("gpu_ar_inverted_index");
     // Fill tracks_per_measurement, track_status_per_measurement and
     // n_accepted_tracks_per_measurement vectors
     {
@@ -330,6 +382,8 @@ greedy_ambiguity_resolution_algorithm::operator()(
 
         m_stream.get().synchronize();
     }
+    AR_NVTX_POP();
+    perf.mark(3, stream);
 
     // Make vector buffer for the number of shared measurements for each track
     vecmem::data::vector_buffer<unsigned int> n_shared_buffer{n_tracks,
@@ -338,6 +392,7 @@ greedy_ambiguity_resolution_algorithm::operator()(
                  n_shared_buffer.ptr() + n_tracks, 0);
     m_copy.get().setup(n_shared_buffer)->ignore();
 
+    AR_NVTX_PUSH("gpu_ar_shared_count");
     // Count the number of shared measurements
     {
         const unsigned int nThreads = m_warp_size * 2;
@@ -355,6 +410,8 @@ greedy_ambiguity_resolution_algorithm::operator()(
 
         m_stream.get().synchronize();
     }
+    AR_NVTX_POP();
+    perf.mark(4, stream);
 
     // Make relative number of shared measurements vector
     // The relative number of shared measurement is defined as the number of
@@ -362,6 +419,7 @@ greedy_ambiguity_resolution_algorithm::operator()(
     vecmem::data::vector_buffer<traccc::scalar> rel_shared_buffer{n_tracks,
                                                                   m_mr.main};
 
+    AR_NVTX_PUSH("gpu_ar_initial_sort");
     // Fill the relative shared number of measurements vector
     thrust::transform(thrust_policy, n_shared_buffer.ptr(),
                       n_shared_buffer.ptr() + n_tracks, n_meas_buffer.ptr(),
@@ -410,6 +468,10 @@ greedy_ambiguity_resolution_algorithm::operator()(
     // measurements and pvalues
     thrust::sort(thrust_policy, sorted_ids_buffer.ptr(),
                  sorted_ids_buffer.ptr() + n_accepted, trk_comp);
+
+    if (m_profiling) m_stream.get().synchronize();
+    AR_NVTX_POP();
+    perf.mark(5, stream);
 
     // Make a buffer of track ids whose number of shared measurements are
     // updated during an iteration
@@ -488,6 +550,7 @@ greedy_ambiguity_resolution_algorithm::operator()(
                                                                   m_mr.main};
     m_copy.get().setup(scanned_block_offsets_buffer)->ignore();
 
+    AR_NVTX_PUSH("gpu_ar_eviction_loop");
     // Start the iteration
     while (!terminate && n_accepted > 0) {
         nBlocks_adaptive =
@@ -663,6 +726,7 @@ greedy_ambiguity_resolution_algorithm::operator()(
         for (unsigned int iter = 0; iter < n_it; iter++) {
             cudaGraphLaunch(graphExec, stream);
         }
+        n_graph_launches += n_it;
 
         cudaMemcpyAsync(&terminate, terminate_device.get(), sizeof(int),
                         cudaMemcpyDeviceToHost, stream);
@@ -670,6 +734,8 @@ greedy_ambiguity_resolution_algorithm::operator()(
                         sizeof(unsigned int), cudaMemcpyDeviceToHost, stream);
         m_stream.get().synchronize();
     }
+    AR_NVTX_POP();
+    perf.mark(6, stream);
 
     cudaMemcpyAsync(&n_accepted, n_accepted_device.get(), sizeof(unsigned int),
                     cudaMemcpyDeviceToHost, stream);
@@ -686,6 +752,7 @@ greedy_ambiguity_resolution_algorithm::operator()(
         tracks_view.measurements};
     m_copy.get().setup(res_track_candidates_buffer.tracks)->ignore();
 
+    AR_NVTX_PUSH("gpu_ar_output_copy");
     // Fill the output track candidates
     {
         if (n_accepted > 0) {
@@ -700,6 +767,20 @@ greedy_ambiguity_resolution_algorithm::operator()(
 
             m_stream.get().synchronize();
         }
+    }
+    AR_NVTX_POP();
+    perf.mark(7, stream);
+
+    if (m_profiling) {
+        cudaStreamSynchronize(stream);
+        m_last_profile.filter_setup_ms          = perf.elapsed(0, 1);
+        m_last_profile.unique_meas_ms           = perf.elapsed(1, 2);
+        m_last_profile.inverted_index_ms        = perf.elapsed(2, 3);
+        m_last_profile.shared_count_ms          = perf.elapsed(3, 4);
+        m_last_profile.initial_sort_ms          = perf.elapsed(4, 5);
+        m_last_profile.eviction_loop_ms         = perf.elapsed(5, 6);
+        m_last_profile.output_copy_ms           = perf.elapsed(6, 7);
+        m_last_profile.eviction_graph_launches  = n_graph_launches;
     }
 
     return res_track_candidates_buffer;
