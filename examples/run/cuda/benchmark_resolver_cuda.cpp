@@ -134,6 +134,8 @@ int main(int argc, char* argv[]) {
     std::size_t repeats  = 10;
     std::size_t warmup   = 3;
     bool profile_mode    = false;
+    unsigned int n_it_max    = 100u;
+    bool adaptive_n_it       = true;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -151,6 +153,10 @@ int main(int argc, char* argv[]) {
             warmup = std::stoull(arg.substr(9));
         else if (arg == "--profile")
             profile_mode = true;
+        else if (arg.find("--n-it=") == 0) {
+            n_it_max = static_cast<unsigned int>(std::stoull(arg.substr(7)));
+            adaptive_n_it = false;
+        }
         else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "benchmark_resolver_cuda: GPU greedy ambiguity resolver benchmark\n"
@@ -160,7 +166,11 @@ int main(int argc, char* argv[]) {
                 << "  --conflict-density=   low|med|high (default med)\n"
                 << "  --repeats=N           Timed iterations (default 10)\n"
                 << "  --warmup=N            Warmup iterations (default 3)\n"
+                << "  --n-it=N              Fix eviction inner-loop iterations to N (disables adaptive)\n"
                 << "  --profile             Run one extra call with per-phase CUDA event timing\n"
+                << "\nAdaptive n_it (default, no --n-it):\n"
+                << "  n_it per outer step = max(1, min(100, n_accepted/50))\n"
+                << "  Gives n=87 -> n_it~1, n=1000 -> n_it~10, n=10000 -> n_it=100\n"
                 << "\n"
                 << "Output fields (same as benchmark_resolver + GPU extras):\n"
                 << "  backend, n_candidates, n_selected, n_removed\n"
@@ -263,6 +273,8 @@ int main(int argc, char* argv[]) {
     traccc::cuda::greedy_ambiguity_resolution_algorithm gpu_resolver(config, mr,
                                                                      copy,
                                                                      stream);
+    gpu_resolver.set_n_it_max(n_it_max);
+    gpu_resolver.set_adaptive_n_it(adaptive_n_it);
 
     // ------------------------------------------------------------------
     // H2D transfer (timed — single pass, before warmup)
@@ -366,6 +378,8 @@ int main(int argc, char* argv[]) {
     // Output  (same key names as benchmark_resolver.cpp where applicable)
     // ------------------------------------------------------------------
     std::cout << "backend=gpu\n"
+              << "n_it_max=" << n_it_max << "\n"
+              << "adaptive_n_it=" << (adaptive_n_it ? "true" : "false") << "\n"
               << "n_candidates=" << n_input
               << " n_selected=" << n_selected_gpu
               << " n_removed=" << (n_input - n_selected_gpu) << "\n"
