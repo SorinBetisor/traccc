@@ -201,6 +201,16 @@ int main(int argc, char* argv[]) {
         dump_data = traccc::io::read_ambiguity_input(input_dump, host_mr);
         input_tracks = &dump_data->tracks;
         config       = dump_data->config;
+        // The GPU resolver requires measurement IDs to form a dense contiguous
+        // range [0, n_meas-1]. Real physics dumps have sparse detector-geometry
+        // IDs. Reassign identifiers sequentially; constituent links already
+        // store collection indices (not raw IDs), so they remain valid.
+        for (traccc::measurement_id_type i = 0;
+             i < static_cast<traccc::measurement_id_type>(
+                     dump_data->measurements.size());
+             ++i) {
+            dump_data->measurements.at(i).identifier() = i;
+        }
     } else if (synthetic) {
         traccc::measurement_id_type max_meas_id = 10000;
         std::array<std::size_t, 2> trk_len_range = {3, 10};
