@@ -82,10 +82,11 @@ class greedy_ambiguity_resolution_algorithm
     /// Calling this also disables the adaptive formula (see set_adaptive_n_it).
     void set_n_it_max(unsigned int n) { m_n_it_max = n; }
 
-    /// When true (default), n_it per outer step is computed adaptively as
-    ///   max(1, min(m_n_it_max, n_accepted / 50))
-    /// so small events spend far fewer iterations than large ones.
-    /// Set to false to force a fixed m_n_it_max every outer step (original behaviour).
+    /// When true (default), n_it per outer step is computed adaptively to
+    /// minimise CUDA Graph construction overhead:
+    ///   n_accepted >= 500: n_it = m_n_it_max  (maximise amortisation)
+    ///   n_accepted <  500: n_it = clamp(n_accepted/5, 10, 50)
+    /// Set to false to force a fixed m_n_it_max every outer step.
     void set_adaptive_n_it(bool on) { m_adaptive_n_it = on; }
 
     private:

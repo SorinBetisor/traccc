@@ -720,9 +720,15 @@ greedy_ambiguity_resolution_algorithm::operator()(
         cudaStreamEndCapture(stream, &graph);
         cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0);
 
+        // Adaptive formula minimises CUDA Graph construction overhead.
+        // Benchmark data shows graph construction (not launch count) dominates
+        // cost. High n_it amortises construction; the exception is very small n
+        // where too many no-op launches waste time when convergence is fast.
         const unsigned int n_it =
             m_adaptive_n_it
-                ? std::max(1u, std::min(m_n_it_max, n_accepted / 50u))
+                ? (n_accepted < 500u
+                       ? std::max(10u, std::min(50u, n_accepted / 5u))
+                       : m_n_it_max)
                 : m_n_it_max;
         for (unsigned int iter = 0; iter < n_it; iter++) {
             cudaGraphLaunch(graphExec, stream);
