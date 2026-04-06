@@ -77,6 +77,17 @@ class greedy_ambiguity_resolution_algorithm
     /// Only valid after a call where set_profiling(true) was active.
     const gpu_profile_data_t& last_profile() const { return m_last_profile; }
 
+    /// Override the maximum inner-loop iterations per outer eviction step.
+    /// Default is 100. Lower values reduce overhead at small n_candidates.
+    /// Calling this also disables the adaptive formula (see set_adaptive_n_it).
+    void set_n_it_max(unsigned int n) { m_n_it_max = n; }
+
+    /// When true (default), n_it per outer step is computed adaptively as
+    ///   max(1, min(m_n_it_max, n_accepted / 50))
+    /// so small events spend far fewer iterations than large ones.
+    /// Set to false to force a fixed m_n_it_max every outer step (original behaviour).
+    void set_adaptive_n_it(bool on) { m_adaptive_n_it = on; }
+
     private:
     /// Algorithm configuration
     config_type m_config;
@@ -90,6 +101,8 @@ class greedy_ambiguity_resolution_algorithm
     unsigned int m_warp_size;
     mutable bool               m_profiling{false};
     mutable gpu_profile_data_t m_last_profile{};
+    unsigned int               m_n_it_max{100u};
+    bool                       m_adaptive_n_it{true};
 };
 
 }  // namespace traccc::cuda

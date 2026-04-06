@@ -720,9 +720,10 @@ greedy_ambiguity_resolution_algorithm::operator()(
         cudaStreamEndCapture(stream, &graph);
         cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0);
 
-        // TODO: Make n_it adaptive based on the average track length, bound
-        // value in remove_tracks, etc.
-        const unsigned int n_it = 100;
+        const unsigned int n_it =
+            m_adaptive_n_it
+                ? std::max(1u, std::min(m_n_it_max, n_accepted / 50u))
+                : m_n_it_max;
         for (unsigned int iter = 0; iter < n_it; iter++) {
             cudaGraphLaunch(graphExec, stream);
         }
