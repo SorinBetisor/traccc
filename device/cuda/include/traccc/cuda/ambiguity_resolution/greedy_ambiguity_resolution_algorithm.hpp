@@ -32,6 +32,7 @@ struct gpu_profile_data_t {
     float eviction_loop_ms   = 0.f;
     float output_copy_ms     = 0.f;
     unsigned int eviction_graph_launches = 0u;
+    unsigned int eviction_graph_instantiations = 0u;
     unsigned int unique_meas_count       = 0u;
 };
 
@@ -89,6 +90,11 @@ class greedy_ambiguity_resolution_algorithm
     /// Set to false to force a fixed m_n_it_max every outer step.
     void set_adaptive_n_it(bool on) { m_adaptive_n_it = on; }
 
+    /// When true, instantiate the eviction CUDA graph once and update dynamic
+    /// kernel launch parameters between outer iterations instead of rebuilding
+    /// the graph every time.
+    void set_reuse_eviction_graph(bool on) { m_reuse_eviction_graph = on; }
+
     private:
     /// Algorithm configuration
     config_type m_config;
@@ -104,6 +110,7 @@ class greedy_ambiguity_resolution_algorithm
     mutable gpu_profile_data_t m_last_profile{};
     unsigned int               m_n_it_max{100u};
     bool                       m_adaptive_n_it{true};
+    bool                       m_reuse_eviction_graph{false};
 };
 
 }  // namespace traccc::cuda

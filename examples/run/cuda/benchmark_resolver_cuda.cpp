@@ -136,6 +136,7 @@ int main(int argc, char* argv[]) {
     bool profile_mode    = false;
     unsigned int n_it_max    = 100u;
     bool adaptive_n_it       = true;
+    bool reuse_eviction_graph = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -153,6 +154,8 @@ int main(int argc, char* argv[]) {
             warmup = std::stoull(arg.substr(9));
         else if (arg == "--profile")
             profile_mode = true;
+        else if (arg == "--reuse-eviction-graph")
+            reuse_eviction_graph = true;
         else if (arg.find("--n-it=") == 0) {
             n_it_max = static_cast<unsigned int>(std::stoull(arg.substr(7)));
             adaptive_n_it = false;
@@ -167,6 +170,7 @@ int main(int argc, char* argv[]) {
                 << "  --repeats=N           Timed iterations (default 10)\n"
                 << "  --warmup=N            Warmup iterations (default 3)\n"
                 << "  --n-it=N              Fix eviction inner-loop iterations to N (disables adaptive)\n"
+                << "  --reuse-eviction-graph Reuse a single CUDA graph exec and update dynamic launch params\n"
                 << "  --profile             Run one extra call with per-phase CUDA event timing\n"
                 << "\nAdaptive n_it (default, no --n-it):\n"
                 << "  n_it per outer step = max(1, min(100, n_accepted/50))\n"
@@ -285,6 +289,7 @@ int main(int argc, char* argv[]) {
                                                                      stream);
     gpu_resolver.set_n_it_max(n_it_max);
     gpu_resolver.set_adaptive_n_it(adaptive_n_it);
+    gpu_resolver.set_reuse_eviction_graph(reuse_eviction_graph);
 
     // ------------------------------------------------------------------
     // H2D transfer (timed — single pass, before warmup)
@@ -390,6 +395,8 @@ int main(int argc, char* argv[]) {
     std::cout << "backend=gpu\n"
               << "n_it_max=" << n_it_max << "\n"
               << "adaptive_n_it=" << (adaptive_n_it ? "true" : "false") << "\n"
+              << "reuse_eviction_graph="
+              << (reuse_eviction_graph ? "true" : "false") << "\n"
               << "n_candidates=" << n_input
               << " n_selected=" << n_selected_gpu
               << " n_removed=" << (n_input - n_selected_gpu) << "\n"
@@ -421,6 +428,8 @@ int main(int argc, char* argv[]) {
                   << "profile_eviction_loop_ms="         << pd.eviction_loop_ms         << "\n"
                   << "profile_output_copy_ms="           << pd.output_copy_ms           << "\n"
                   << "profile_eviction_graph_launches="  << pd.eviction_graph_launches  << "\n"
+                  << "profile_eviction_graph_instantiations="
+                  << pd.eviction_graph_instantiations << "\n"
                   << "profile_unique_meas_count="        << pd.unique_meas_count        << "\n"
                   << "profile_hash_match="               << (hash_match ? "true" : "false") << "\n";
     }

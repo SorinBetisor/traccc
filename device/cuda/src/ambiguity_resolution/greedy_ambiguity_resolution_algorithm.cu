@@ -45,6 +45,8 @@
 #include <thrust/sort.h>
 #include <thrust/transform.h>
 #include <thrust/unique.h>
+
+#include <vector>
 namespace {
 
 /// Lightweight CUDA event set used for per-phase elapsed-time measurement.
@@ -74,6 +76,50 @@ struct PerfEvents {
         return ms;
     }
 };
+
+struct eviction_launch_config {
+    unsigned int nThreads_adaptive{0u};
+    unsigned int nBlocks_adaptive{0u};
+    unsigned int nThreads_rearrange{0u};
+    unsigned int nBlocks_rearrange{0u};
+    unsigned int nThreads_scan{0u};
+    unsigned int nBlocks_scan{0u};
+};
+
+struct eviction_graph_nodes {
+    cudaGraphNode_t fill_inverted_ids{nullptr};
+    cudaGraphNode_t block_inclusive_scan{nullptr};
+    cudaGraphNode_t scan_block_offsets{nullptr};
+    cudaGraphNode_t add_block_offset{nullptr};
+    cudaGraphNode_t rearrange_tracks{nullptr};
+    cudaGraphNode_t update_status{nullptr};
+};
+
+struct graph_exec_holder {
+    cudaGraph_t graph{nullptr};
+    cudaGraphExec_t exec{nullptr};
+
+    ~graph_exec_holder() {
+        if (exec != nullptr) {
+            cudaGraphExecDestroy(exec);
+        }
+        if (graph != nullptr) {
+            cudaGraphDestroy(graph);
+        }
+    }
+};
+
+void set_kernel_node_launch(cudaGraphExec_t graph_exec, cudaGraphNode_t node,
+                            dim3 grid, dim3 block,
+                            std::size_t shared_mem_bytes = 0u) {
+    cudaKernelNodeParams params{};
+    TRACCC_CUDA_ERROR_CHECK(cudaGraphKernelNodeGetParams(node, &params));
+    params.gridDim = grid;
+    params.blockDim = block;
+    params.sharedMemBytes = static_cast<unsigned int>(shared_mem_bytes);
+    TRACCC_CUDA_ERROR_CHECK(
+        cudaGraphExecKernelNodeSetParams(graph_exec, node, &params));
+}
 
 }  // namespace
 
@@ -168,6 +214,7 @@ greedy_ambiguity_resolution_algorithm::operator()(
 
     PerfEvents perf(m_profiling, stream);
     unsigned int n_graph_launches = 0u;
+    unsigned int n_graph_instantiations = 0u;
 
     // Make sure that max_shared_meas is largen than zero
     assert(m_config.max_shared_meas > 0u);
@@ -506,73 +553,58 @@ greedy_ambiguity_resolution_algorithm::operator()(
     vecmem::unique_alloc_ptr<unsigned int> n_updated_tracks_device =
         vecmem::make_unique_alloc<unsigned int>(m_mr.main);
 
-    // Thread block size
-    unsigned int nThreads_adaptive = m_warp_size;
-    unsigned int nBlocks_adaptive =
-        (n_accepted + nThreads_adaptive - 1) / nThreads_adaptive;
+    // Compute the threadblock dimensions for the eviction-loop kernels.
+    auto compute_eviction_launch_config = [&](unsigned int accepted) {
+        eviction_launch_config cfg{};
+        cfg.nThreads_adaptive = m_warp_size;
+        cfg.nBlocks_adaptive =
+            (accepted + cfg.nThreads_adaptive - 1) / cfg.nThreads_adaptive;
 
-    unsigned int nThreads_rearrange = 1024;
-    unsigned int nBlocks_rearrange =
-        (n_accepted + (nThreads_rearrange / kernels::nThreads_per_track) - 1) /
-        (nThreads_rearrange / kernels::nThreads_per_track);
+        cfg.nThreads_rearrange = 1024;
+        cfg.nBlocks_rearrange =
+            (accepted +
+             (cfg.nThreads_rearrange / kernels::nThreads_per_track) - 1) /
+            (cfg.nThreads_rearrange / kernels::nThreads_per_track);
 
-    // Compute the threadblock dimension for scanning kernels
-    auto compute_scan_config = [&](unsigned int n_accepted) {
-        unsigned int nThreads_scan = m_warp_size * 4;
-        unsigned int nBlocks_scan =
-            (n_accepted + nThreads_scan - 1) / nThreads_scan;
+        cfg.nThreads_scan = m_warp_size * 4;
+        cfg.nBlocks_scan =
+            (accepted + cfg.nThreads_scan - 1) / cfg.nThreads_scan;
 
-        while (nThreads_scan <= 1024) {
-            if (nBlocks_scan > 1024) {
-                nThreads_scan *= 2;
-                nBlocks_scan = (n_accepted + nThreads_scan - 1) / nThreads_scan;
+        while (cfg.nThreads_scan <= 1024) {
+            if (cfg.nBlocks_scan > 1024) {
+                cfg.nThreads_scan *= 2;
+                cfg.nBlocks_scan =
+                    (accepted + cfg.nThreads_scan - 1) / cfg.nThreads_scan;
             } else {
                 break;
             }
         }
 
-        return std::make_pair(nThreads_scan, nBlocks_scan);
+        return cfg;
     };
 
-    auto scan_dim = compute_scan_config(n_accepted);
-    unsigned int nThreads_scan = scan_dim.first;
-    unsigned int nBlocks_scan = scan_dim.second;
+    auto launch_cfg = compute_eviction_launch_config(n_accepted);
 
-    assert(nBlocks_scan <= 1024 &&
+    assert(launch_cfg.nBlocks_scan <= 1024 &&
            "nBlocks_scan larger than 1024 will cause invalid arguments in "
            "scan_block_offsets kernel");
 
     // Make buffers used in prefix sum calculation
-    vecmem::data::vector_buffer<int> block_offsets_buffer{nBlocks_scan,
+    vecmem::data::vector_buffer<int> block_offsets_buffer{
+        launch_cfg.nBlocks_scan,
                                                           m_mr.main};
     m_copy.get().setup(block_offsets_buffer)->ignore();
-    vecmem::data::vector_buffer<int> scanned_block_offsets_buffer{nBlocks_scan,
+    vecmem::data::vector_buffer<int> scanned_block_offsets_buffer{
+        launch_cfg.nBlocks_scan,
                                                                   m_mr.main};
     m_copy.get().setup(scanned_block_offsets_buffer)->ignore();
 
-    AR_NVTX_PUSH("gpu_ar_eviction_loop");
-    // Start the iteration
-    while (!terminate && n_accepted > 0) {
-        nBlocks_adaptive =
-            (n_accepted + nThreads_adaptive - 1) / nThreads_adaptive;
+    auto capture_eviction_graph = [&](const eviction_launch_config& cfg,
+                                      cudaGraph_t* graph_out,
+                                      cudaGraphExec_t* graph_exec_out) {
+        TRACCC_CUDA_ERROR_CHECK(
+            cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
 
-        scan_dim = compute_scan_config(n_accepted);
-        nThreads_scan = scan_dim.first;
-        nBlocks_scan = scan_dim.second;
-        nBlocks_rearrange =
-            (n_accepted + (nThreads_rearrange / kernels::nThreads_per_track) -
-             1) /
-            (nThreads_rearrange / kernels::nThreads_per_track);
-
-        // Make a CUDA Graph. We use CUDA graph to minimize the overheads from
-        // kernel launches
-        cudaGraph_t graph;
-        cudaGraphExec_t graphExec;
-
-        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
-
-        // Counts the number of removable tracks in the current iteration and
-        // remove them from the track pool
         kernels::remove_tracks<<<1, 512, 0, stream>>>(
             device::remove_tracks_payload{
                 .sorted_ids_view = sorted_ids_buffer,
@@ -597,28 +629,6 @@ greedy_ambiguity_resolution_algorithm::operator()(
                 .n_valid_threads = n_valid_threads_device.get(),
                 .track_count_view = track_count_buffer});
 
-        // After the kernel "remove_tracks", sorted_ids_view is not sorted
-        // anymore as the number of measurements of a few tracks might change.
-        // We can consider using thrust::sort() like the following:
-        /*
-        cudaMemcpyAsync(&n_accepted, n_accepted_device.get(),
-                        sizeof(unsigned int), cudaMemcpyDeviceToHost,
-                        stream);
-        thrust::sort(thrust_policy, sorted_ids_buffer.ptr(),
-                     sorted_ids_buffer.ptr() + n_accepted,
-                     trk_comp);
-        */
-        // However, thrust::sort (Radix sort) is not optimized for our case
-        // where we only need to rearrange the indices of a few tracks whose
-        // number of measurement changed. In such case, insertion sort would be
-        // a good choice and the following seven kernels are collaborating each
-        // other to do insertion sort
-
-        // This kernel sort the tracks whose number of measurement changed
-        // during remove_track kernel. The number of such tracks are very small
-        // and we apply bitoncic sort here. The purpose is to make each of
-        // updated tracks not interfere each other when we rearrange them during
-        // the insertion sort
         kernels::sort_updated_tracks<<<1, 512, 0, stream>>>(
             device::sort_updated_tracks_payload{
                 .rel_shared_view = rel_shared_buffer,
@@ -628,10 +638,8 @@ greedy_ambiguity_resolution_algorithm::operator()(
                 .updated_tracks_view = updated_tracks_buffer,
             });
 
-        // Fill the inverted_ids vector which converts a track id to the index
-        // of sorted ids, which is for the fast lookup
-        kernels::fill_inverted_ids<<<nBlocks_adaptive, nThreads_adaptive, 0,
-                                     stream>>>(
+        kernels::fill_inverted_ids<<<cfg.nBlocks_adaptive,
+                                     cfg.nThreads_adaptive, 0, stream>>>(
             device::fill_inverted_ids_payload{
                 .sorted_ids_view = sorted_ids_buffer,
                 .terminate = terminate_device.get(),
@@ -640,19 +648,9 @@ greedy_ambiguity_resolution_algorithm::operator()(
                 .inverted_ids_view = inverted_ids_buffer,
             });
 
-        // The three kernels (block_inclusive_scan, scan_block_offsets, and
-        // add_block_offset) work together to compute the prefix sum of track
-        // IDs, with respect to the number of updated tracks, based on the
-        // indices of sorted_ids. The kernels are splitted as it is not
-        // efficient to calculate this in a single kernel. This prefix sums are
-        // used during the insertion sorting in rearrange_tracks to precisely
-        // calculate the new index of updated tracks
-
-        // Caculate the prefix sum of the number of updated tracks block-wisely.
-        // block_offset is the last element of block-wise prefix sums, which is
-        // used to get the real prefix sum later
-        kernels::block_inclusive_scan<<<nBlocks_scan, nThreads_scan,
-                                        nThreads_scan * sizeof(int), stream>>>(
+        kernels::block_inclusive_scan<<<cfg.nBlocks_scan, cfg.nThreads_scan,
+                                        cfg.nThreads_scan * sizeof(int),
+                                        stream>>>(
             device::block_inclusive_scan_payload{
                 .sorted_ids_view = sorted_ids_buffer,
                 .terminate = terminate_device.get(),
@@ -662,10 +660,8 @@ greedy_ambiguity_resolution_algorithm::operator()(
                 .block_offsets_view = block_offsets_buffer,
                 .prefix_sums_view = prefix_sums_buffer});
 
-        // Calculate the scanned block offsets which is the prefix sum of block
-        // offsets
-        kernels::scan_block_offsets<<<1, nBlocks_scan,
-                                      nBlocks_scan * sizeof(int), stream>>>(
+        kernels::scan_block_offsets<<<1, cfg.nBlocks_scan,
+                                      cfg.nBlocks_scan * sizeof(int), stream>>>(
             device::scan_block_offsets_payload{
                 .terminate = terminate_device.get(),
                 .n_accepted = n_accepted_device.get(),
@@ -673,9 +669,8 @@ greedy_ambiguity_resolution_algorithm::operator()(
                 .block_offsets_view = block_offsets_buffer,
                 .scanned_block_offsets_view = scanned_block_offsets_buffer});
 
-        // To calculate the real prefix-sum, add the scanned block offsets to
-        // block-wise prefix sums of the number of updated tracks.
-        kernels::add_block_offset<<<nBlocks_scan, nThreads_scan, 0, stream>>>(
+        kernels::add_block_offset<<<cfg.nBlocks_scan, cfg.nThreads_scan, 0,
+                                    stream>>>(
             device::add_block_offset_payload{
                 .terminate = terminate_device.get(),
                 .n_accepted = n_accepted_device.get(),
@@ -683,42 +678,154 @@ greedy_ambiguity_resolution_algorithm::operator()(
                 .block_offsets_view = scanned_block_offsets_buffer,
                 .prefix_sums_view = prefix_sums_buffer});
 
-        // Apply the insertion sort algorithm to sorted_ids_view using the
-        // sorted updated tracks and prefix sums. The sorted elements are stored
-        // in temp_sorted_ids_view
-        kernels::rearrange_tracks<<<nBlocks_rearrange, nThreads_rearrange, 0,
-                                    stream>>>(device::rearrange_tracks_payload{
-            .sorted_ids_view = sorted_ids_buffer,
-            .inverted_ids_view = inverted_ids_buffer,
-            .rel_shared_view = rel_shared_buffer,
-            .pvals_view = pvals_buffer,
-            .terminate = terminate_device.get(),
-            .n_accepted = n_accepted_device.get(),
-            .n_updated_tracks = n_updated_tracks_device.get(),
-            .updated_tracks_view = updated_tracks_buffer,
-            .is_updated_view = is_updated_buffer,
-            .prefix_sums_view = prefix_sums_buffer,
-            .temp_sorted_ids_view = temp_sorted_ids_buffer,
-        });
+        kernels::rearrange_tracks<<<cfg.nBlocks_rearrange,
+                                    cfg.nThreads_rearrange, 0, stream>>>(
+            device::rearrange_tracks_payload{
+                .sorted_ids_view = sorted_ids_buffer,
+                .inverted_ids_view = inverted_ids_buffer,
+                .rel_shared_view = rel_shared_buffer,
+                .pvals_view = pvals_buffer,
+                .terminate = terminate_device.get(),
+                .n_accepted = n_accepted_device.get(),
+                .n_updated_tracks = n_updated_tracks_device.get(),
+                .updated_tracks_view = updated_tracks_buffer,
+                .is_updated_view = is_updated_buffer,
+                .prefix_sums_view = prefix_sums_buffer,
+                .temp_sorted_ids_view = temp_sorted_ids_buffer,
+            });
 
-        // Find the max shared number of measurements to decide whether to
-        // terminate the process. Also Move the elements in temp_sorted_ids to
-        // sorted_ids
         kernels::
-            update_status<<<nBlocks_adaptive, nThreads_adaptive, 0, stream>>>(
-                device::update_status_payload{
-                    .terminate = terminate_device.get(),
-                    .n_accepted = n_accepted_device.get(),
-                    .n_updated_tracks = n_updated_tracks_device.get(),
-                    .temp_sorted_ids_view = temp_sorted_ids_buffer,
-                    .sorted_ids_view = sorted_ids_buffer,
-                    .updated_tracks_view = updated_tracks_buffer,
-                    .is_updated_view = is_updated_buffer,
-                    .n_shared_view = n_shared_buffer,
-                    .max_shared = max_shared_device.get()});
+            update_status<<<cfg.nBlocks_adaptive, cfg.nThreads_adaptive, 0,
+                            stream>>>(device::update_status_payload{
+                .terminate = terminate_device.get(),
+                .n_accepted = n_accepted_device.get(),
+                .n_updated_tracks = n_updated_tracks_device.get(),
+                .temp_sorted_ids_view = temp_sorted_ids_buffer,
+                .sorted_ids_view = sorted_ids_buffer,
+                .updated_tracks_view = updated_tracks_buffer,
+                .is_updated_view = is_updated_buffer,
+                .n_shared_view = n_shared_buffer,
+                .max_shared = max_shared_device.get()});
 
-        cudaStreamEndCapture(stream, &graph);
-        cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0);
+        TRACCC_CUDA_ERROR_CHECK(cudaStreamEndCapture(stream, graph_out));
+        TRACCC_CUDA_ERROR_CHECK(
+            cudaGraphInstantiate(graph_exec_out, *graph_out, nullptr, nullptr,
+                                 0));
+        ++n_graph_instantiations;
+    };
+
+    auto collect_eviction_graph_nodes = [&](cudaGraph_t graph) {
+        std::size_t num_nodes = 0u;
+        TRACCC_CUDA_ERROR_CHECK(cudaGraphGetNodes(graph, nullptr, &num_nodes));
+        if (num_nodes != 8u) {
+            throw std::runtime_error(
+                "Unexpected eviction graph structure while collecting nodes");
+        }
+
+        std::vector<cudaGraphNode_t> nodes(num_nodes);
+        TRACCC_CUDA_ERROR_CHECK(
+            cudaGraphGetNodes(graph, nodes.data(), &num_nodes));
+
+        for (cudaGraphNode_t node : nodes) {
+            cudaGraphNodeType node_type{};
+            TRACCC_CUDA_ERROR_CHECK(cudaGraphNodeGetType(node, &node_type));
+            if (node_type != cudaGraphNodeTypeKernel) {
+                throw std::runtime_error(
+                    "Eviction graph contains a non-kernel node");
+            }
+        }
+
+        // The captured graph is a fixed linear chain of eight kernels.
+        return eviction_graph_nodes{
+            .fill_inverted_ids = nodes[2],
+            .block_inclusive_scan = nodes[3],
+            .scan_block_offsets = nodes[4],
+            .add_block_offset = nodes[5],
+            .rearrange_tracks = nodes[6],
+            .update_status = nodes[7],
+        };
+    };
+
+    auto update_eviction_graph_launches = [&](cudaGraphExec_t graph_exec,
+                                              const eviction_graph_nodes& nodes,
+                                              const eviction_launch_config& cfg) {
+        set_kernel_node_launch(graph_exec, nodes.fill_inverted_ids,
+                               dim3(cfg.nBlocks_adaptive),
+                               dim3(cfg.nThreads_adaptive));
+        set_kernel_node_launch(graph_exec, nodes.block_inclusive_scan,
+                               dim3(cfg.nBlocks_scan),
+                               dim3(cfg.nThreads_scan),
+                               cfg.nThreads_scan * sizeof(int));
+        set_kernel_node_launch(graph_exec, nodes.scan_block_offsets,
+                               dim3(1u), dim3(cfg.nBlocks_scan),
+                               cfg.nBlocks_scan * sizeof(int));
+        set_kernel_node_launch(graph_exec, nodes.add_block_offset,
+                               dim3(cfg.nBlocks_scan),
+                               dim3(cfg.nThreads_scan));
+        set_kernel_node_launch(graph_exec, nodes.rearrange_tracks,
+                               dim3(cfg.nBlocks_rearrange),
+                               dim3(cfg.nThreads_rearrange));
+        set_kernel_node_launch(graph_exec, nodes.update_status,
+                               dim3(cfg.nBlocks_adaptive),
+                               dim3(cfg.nThreads_adaptive));
+    };
+
+    AR_NVTX_PUSH("gpu_ar_eviction_loop");
+    graph_exec_holder reused_graph;
+    eviction_graph_nodes reused_nodes{};
+    bool reused_graph_ready = false;
+
+    // Start the iteration
+    while (!terminate && n_accepted > 0) {
+        launch_cfg = compute_eviction_launch_config(n_accepted);
+
+        assert(launch_cfg.nBlocks_scan <= 1024 &&
+               "nBlocks_scan larger than 1024 will cause invalid arguments "
+               "in scan_block_offsets kernel");
+
+        cudaGraphExec_t graph_exec = nullptr;
+
+        if (m_reuse_eviction_graph) {
+            if (!reused_graph_ready) {
+                capture_eviction_graph(launch_cfg, &reused_graph.graph,
+                                      &reused_graph.exec);
+                reused_nodes = collect_eviction_graph_nodes(reused_graph.graph);
+                reused_graph_ready = true;
+            } else {
+                update_eviction_graph_launches(reused_graph.exec, reused_nodes,
+                                               launch_cfg);
+            }
+            graph_exec = reused_graph.exec;
+        } else {
+            graph_exec_holder loop_graph;
+            capture_eviction_graph(launch_cfg, &loop_graph.graph,
+                                  &loop_graph.exec);
+            graph_exec = loop_graph.exec;
+
+            // Adaptive formula minimises CUDA Graph construction overhead.
+            // Benchmark data shows graph construction (not launch count)
+            // dominates cost. High n_it amortises construction; the exception
+            // is very small n where too many no-op launches waste time when
+            // convergence is fast.
+            const unsigned int n_it =
+                m_adaptive_n_it
+                    ? (n_accepted < 500u
+                           ? std::max(10u, std::min(50u, n_accepted / 5u))
+                           : m_n_it_max)
+                    : m_n_it_max;
+            for (unsigned int iter = 0; iter < n_it; iter++) {
+                TRACCC_CUDA_ERROR_CHECK(cudaGraphLaunch(graph_exec, stream));
+            }
+            n_graph_launches += n_it;
+
+            cudaMemcpyAsync(&terminate, terminate_device.get(), sizeof(int),
+                            cudaMemcpyDeviceToHost, stream);
+            cudaMemcpyAsync(&n_accepted, n_accepted_device.get(),
+                            sizeof(unsigned int), cudaMemcpyDeviceToHost,
+                            stream);
+            m_stream.get().synchronize();
+            continue;
+        }
 
         // Adaptive formula minimises CUDA Graph construction overhead.
         // Benchmark data shows graph construction (not launch count) dominates
@@ -731,7 +838,7 @@ greedy_ambiguity_resolution_algorithm::operator()(
                        : m_n_it_max)
                 : m_n_it_max;
         for (unsigned int iter = 0; iter < n_it; iter++) {
-            cudaGraphLaunch(graphExec, stream);
+            TRACCC_CUDA_ERROR_CHECK(cudaGraphLaunch(graph_exec, stream));
         }
         n_graph_launches += n_it;
 
@@ -788,6 +895,7 @@ greedy_ambiguity_resolution_algorithm::operator()(
         m_last_profile.eviction_loop_ms         = perf.elapsed(5, 6);
         m_last_profile.output_copy_ms           = perf.elapsed(6, 7);
         m_last_profile.eviction_graph_launches  = n_graph_launches;
+        m_last_profile.eviction_graph_instantiations = n_graph_instantiations;
     }
 
     return res_track_candidates_buffer;
