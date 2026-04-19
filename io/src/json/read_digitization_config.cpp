@@ -39,9 +39,9 @@ traccc::digitization_config read_digitization_config(
 
         Acts::GeometryIdentifier geoId;
         Acts::GeometryIdentifier::Value null(0u);
-        geoId = geoId.withVolume(entry.value("volume", null))
-                    .withLayer(entry.value("layer", null))
-                    .withSensitive(entry.value("sensitive", null));
+        geoId.setVolume(entry.value("volume", null))
+            .setLayer(entry.value("layer", null))
+            .setSensitive(entry.value("sensitive", null));
 
         const auto& json_val = entry["value"];
         const auto& json_geom = json_val[geometric];
