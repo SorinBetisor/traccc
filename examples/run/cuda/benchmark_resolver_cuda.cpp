@@ -20,10 +20,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -115,6 +118,90 @@ std::string compute_hash_buffer(
     return std::to_string(std::hash<std::string>{}(oss.str()));
 }
 
+/// Extract the set of sorted measurement-id patterns that identify the
+/// selected tracks. Two tracks are considered "the same selection" iff they
+/// have the same sorted measurement pattern.
+std::set<std::vector<traccc::measurement_id_type>> extract_patterns_host(
+    const traccc::edm::track_container<traccc::default_algebra>::host& out) {
+    std::set<std::vector<traccc::measurement_id_type>> patterns;
+    traccc::edm::measurement_collection<traccc::default_algebra>::const_device
+        meas{out.measurements};
+    for (std::size_t i = 0; i < out.tracks.size(); ++i) {
+        std::vector<traccc::measurement_id_type> p;
+        for (const auto& [type, idx] : out.tracks.at(i).constituent_links()) {
+            if (type == traccc::edm::track_constituent_link::measurement)
+                p.push_back(meas.at(idx).identifier());
+        }
+        std::sort(p.begin(), p.end());
+        patterns.insert(std::move(p));
+    }
+    return patterns;
+}
+
+std::set<std::vector<traccc::measurement_id_type>> extract_patterns_buffer(
+    const traccc::edm::track_container<traccc::default_algebra>::buffer& buf) {
+    std::set<std::vector<traccc::measurement_id_type>> patterns;
+    traccc::edm::track_container<traccc::default_algebra>::const_device dev{
+        buf};
+    const traccc::edm::measurement_collection<
+        traccc::default_algebra>::const_device meas{buf.measurements};
+    for (std::uint32_t i = 0;
+         i < static_cast<std::uint32_t>(dev.tracks.size()); ++i) {
+        std::vector<traccc::measurement_id_type> p;
+        for (const auto& [type, idx] : dev.tracks.at(i).constituent_links()) {
+            if (type == traccc::edm::track_constituent_link::measurement)
+                p.push_back(meas.at(idx).identifier());
+        }
+        std::sort(p.begin(), p.end());
+        patterns.insert(std::move(p));
+    }
+    return patterns;
+}
+
+/// Track-selection overlap: |gpu ∩ cpu| / |cpu|. A quality proxy that works
+/// when the GPU output is not byte-identical to the CPU reference (as is the
+/// case for parallel batch greedy by design).
+double track_selection_overlap(
+    const std::set<std::vector<traccc::measurement_id_type>>& gpu,
+    const std::set<std::vector<traccc::measurement_id_type>>& cpu) {
+    if (cpu.empty()) {
+        return 1.0;
+    }
+    std::size_t inter = 0;
+    for (const auto& p : gpu) {
+        if (cpu.count(p) > 0) {
+            ++inter;
+        }
+    }
+    return static_cast<double>(inter) /
+           static_cast<double>(cpu.size());
+}
+
+/// Post-resolve duplicate rate = (# measurement slots that are shared by >= 2
+/// accepted tracks) / (total # distinct measurements used by accepted tracks).
+/// Range [0, 1]; lower is cleaner (fewer remaining ambiguities). Computed
+/// identically for CPU and GPU so the two are directly comparable.
+double duplicate_rate(
+    const std::set<std::vector<traccc::measurement_id_type>>& patterns) {
+    std::map<traccc::measurement_id_type, std::size_t> count;
+    for (const auto& p : patterns) {
+        for (auto id : p) {
+            ++count[id];
+        }
+    }
+    if (count.empty()) {
+        return 0.0;
+    }
+    std::size_t shared = 0;
+    for (const auto& [_, n] : count) {
+        if (n >= 2) {
+            ++shared;
+        }
+    }
+    return static_cast<double>(shared) /
+           static_cast<double>(count.size());
+}
+
 double get_peak_rss_mb() {
 #ifdef __linux__
     struct rusage ru;
@@ -136,6 +223,9 @@ int main(int argc, char* argv[]) {
     bool profile_mode    = false;
     unsigned int n_it_max    = 100u;
     bool adaptive_n_it       = true;
+    bool parallel_batch      = false;
+    unsigned int parallel_batch_window = 8192u;
+    std::string log_batch_sizes_path;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -157,6 +247,17 @@ int main(int argc, char* argv[]) {
             n_it_max = static_cast<unsigned int>(std::stoull(arg.substr(7)));
             adaptive_n_it = false;
         }
+        else if (arg == "--parallel-batch")
+            parallel_batch = true;
+        else if (arg.find("--parallel-batch-window=") == 0) {
+            parallel_batch_window = static_cast<unsigned int>(
+                std::stoull(arg.substr(24)));
+            parallel_batch = true;
+        }
+        else if (arg.find("--log-batch-sizes=") == 0) {
+            log_batch_sizes_path = arg.substr(18);
+            parallel_batch = true;
+        }
         else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "benchmark_resolver_cuda: GPU greedy ambiguity resolver benchmark\n"
@@ -168,6 +269,9 @@ int main(int argc, char* argv[]) {
                 << "  --warmup=N            Warmup iterations (default 3)\n"
                 << "  --n-it=N              Fix eviction inner-loop iterations to N (disables adaptive)\n"
                 << "  --profile             Run one extra call with per-phase CUDA event timing\n"
+                << "  --parallel-batch      Also run the Tier 2a parallel batch greedy path\n"
+                << "  --parallel-batch-window=N   Candidate window size for PBG (default 8192)\n"
+                << "  --log-batch-sizes=<path.csv>  Write per-outer-iteration batch sizes to CSV\n"
                 << "\nAdaptive n_it (default, no --n-it):\n"
                 << "  n_it per outer step = max(1, min(100, n_accepted/50))\n"
                 << "  Gives n=87 -> n_it~1, n=1000 -> n_it~10, n=10000 -> n_it=100\n"
@@ -286,6 +390,10 @@ int main(int argc, char* argv[]) {
     gpu_resolver.set_n_it_max(n_it_max);
     gpu_resolver.set_adaptive_n_it(adaptive_n_it);
 
+    // CPU reference patterns for overlap computation.
+    const auto cpu_patterns = extract_patterns_host(cpu_result);
+    const double cpu_dup_rate = duplicate_rate(cpu_patterns);
+
     // ------------------------------------------------------------------
     // H2D transfer (timed — single pass, before warmup)
     // ------------------------------------------------------------------
@@ -308,103 +416,203 @@ int main(int argc, char* argv[]) {
         std::move(tracks_device_buf), {}, meas_device_buf};
 
     // ------------------------------------------------------------------
-    // Warmup (not timed)
+    // Per-backend run helper. Captures warmup + timed loop + D2H + metrics.
     // ------------------------------------------------------------------
-    for (std::size_t w = 0; w < warmup; ++w) {
-        gpu_resolver(device_input);
+    struct run_metrics {
+        std::string label;
+        double mean_ms = 0.0, std_ms = 0.0, median_ms = 0.0, p95_ms = 0.0;
+        double d2h_ms = 0.0;
+        std::size_t n_selected = 0;
+        std::string gpu_hash;
+        bool hash_match = false;
+        double track_overlap_vs_cpu = 0.0;
+        double duplicate_rate_post = 0.0;
+        std::vector<unsigned int> batch_sizes;
+    };
+
+    auto run_one = [&](const std::string& label, bool use_pbg,
+                       std::vector<unsigned int>* batch_log) -> run_metrics {
+        gpu_resolver.set_parallel_batch_mode(use_pbg);
+        gpu_resolver.set_parallel_batch_window(parallel_batch_window);
+        gpu_resolver.set_batch_size_log(batch_log);
+
+        for (std::size_t w = 0; w < warmup; ++w) {
+            gpu_resolver(device_input);
+            stream.synchronize();
+        }
+
+        std::vector<double> times_ms;
+        times_ms.reserve(repeats);
+        for (std::size_t r = 0; r < repeats; ++r) {
+            auto t0 = clk::now();
+            gpu_resolver(device_input);
+            stream.synchronize();
+            times_ms.push_back(ms_dur(clk::now() - t0).count());
+        }
+
+        auto check_result_buf = gpu_resolver(device_input);
         stream.synchronize();
+
+        auto d2h_t0 = clk::now();
+        traccc::edm::track_container<traccc::default_algebra>::buffer
+            result_host_buf{
+                copy.to(check_result_buf.tracks, host_mr, nullptr,
+                        vecmem::copy::type::device_to_host),
+                {},
+                vecmem::get_data(*meas_host_ptr)};
+        stream.synchronize();
+        double d2h_ms_local = ms_dur(clk::now() - d2h_t0).count();
+
+        run_metrics m;
+        m.label = label;
+
+        m.gpu_hash = compute_hash_buffer(result_host_buf);
+        m.n_selected =
+            traccc::edm::track_container<traccc::default_algebra>::const_device{
+                result_host_buf}
+                .tracks.size();
+        m.d2h_ms = d2h_ms_local;
+
+        m.mean_ms =
+            std::accumulate(times_ms.begin(), times_ms.end(), 0.0) /
+            static_cast<double>(repeats);
+        double sum_sq = 0;
+        for (double t : times_ms) sum_sq += (t - m.mean_ms) * (t - m.mean_ms);
+        m.std_ms = std::sqrt(sum_sq / static_cast<double>(repeats));
+
+        std::vector<double> sorted_times = times_ms;
+        std::nth_element(sorted_times.begin(),
+                         sorted_times.begin() +
+                             static_cast<std::ptrdiff_t>(repeats / 2),
+                         sorted_times.end());
+        m.median_ms = sorted_times[repeats / 2];
+
+        std::size_t p95_idx =
+            static_cast<std::size_t>(static_cast<double>(repeats) * 0.95);
+        if (p95_idx >= repeats) p95_idx = repeats - 1;
+        std::nth_element(sorted_times.begin(),
+                         sorted_times.begin() +
+                             static_cast<std::ptrdiff_t>(p95_idx),
+                         sorted_times.end());
+        m.p95_ms = sorted_times[p95_idx];
+
+        m.hash_match = (m.gpu_hash == cpu_hash);
+
+        auto gpu_patterns = extract_patterns_buffer(result_host_buf);
+        m.track_overlap_vs_cpu =
+            track_selection_overlap(gpu_patterns, cpu_patterns);
+        m.duplicate_rate_post = duplicate_rate(gpu_patterns);
+
+        if (batch_log != nullptr) {
+            m.batch_sizes = *batch_log;
+        }
+        return m;
+    };
+
+    // ------------------------------------------------------------------
+    // Baseline run (always).
+    // ------------------------------------------------------------------
+    const auto baseline = run_one("baseline", false, nullptr);
+
+    // Optional PBG run.
+    std::optional<run_metrics> pbg;
+    if (parallel_batch) {
+        std::vector<unsigned int> pbg_batch_log;
+        pbg = run_one("parallel_batch", true, &pbg_batch_log);
     }
 
-    // ------------------------------------------------------------------
-    // Timed loop  — resolver + synchronize only, no transfers
-    // ------------------------------------------------------------------
-    std::vector<double> times_ms;
-    times_ms.reserve(repeats);
+    double peak_mb = get_peak_rss_mb();
 
-    for (std::size_t r = 0; r < repeats; ++r) {
-        auto t0 = clk::now();
-        gpu_resolver(device_input);
-        stream.synchronize();
-        times_ms.push_back(ms_dur(clk::now() - t0).count());
-    }
+    auto dump_backend_metrics =
+        [&](const run_metrics& m, const std::string& prefix) {
+            std::cout << prefix << "label=" << m.label << "\n"
+                      << prefix << "n_selected=" << m.n_selected
+                      << " n_removed=" << (n_input - m.n_selected) << "\n"
+                      << prefix << "time_ms_mean=" << m.mean_ms
+                      << " time_ms_std=" << m.std_ms
+                      << " time_ms_median=" << m.median_ms
+                      << " time_ms_p95=" << m.p95_ms << "\n"
+                      << prefix << "events_per_sec=" << (1000.0 / m.mean_ms)
+                      << "\n"
+                      << prefix << "time_d2h_ms=" << m.d2h_ms << "\n"
+                      << prefix << "output_hash=" << m.gpu_hash << "\n"
+                      << prefix << "hash_match="
+                      << (m.hash_match ? "true" : "false") << "\n"
+                      << prefix << "track_overlap_vs_cpu="
+                      << m.track_overlap_vs_cpu << "\n"
+                      << prefix << "duplicate_rate_post="
+                      << m.duplicate_rate_post << "\n";
+        };
 
-    // ------------------------------------------------------------------
-    // Post-timing: one extra GPU call, then D2H for correctness check
-    // ------------------------------------------------------------------
-    auto check_result_buf = gpu_resolver(device_input);
-    stream.synchronize();
-
-    auto d2h_t0 = clk::now();
-
-    traccc::edm::track_container<traccc::default_algebra>::buffer result_host_buf{
-        copy.to(check_result_buf.tracks, host_mr, nullptr,
-                vecmem::copy::type::device_to_host),
-        {},
-        vecmem::get_data(*meas_host_ptr)};
-    stream.synchronize();
-
-    double d2h_ms = ms_dur(clk::now() - d2h_t0).count();
-
-    const std::string gpu_hash = compute_hash_buffer(result_host_buf);
-    const std::size_t n_selected_gpu =
-        traccc::edm::track_container<traccc::default_algebra>::const_device{
-            result_host_buf}
-            .tracks.size();
-
-    // ------------------------------------------------------------------
-    // Statistics
-    // ------------------------------------------------------------------
-    double mean_ms =
-        std::accumulate(times_ms.begin(), times_ms.end(), 0.0) /
-        static_cast<double>(repeats);
-    double sum_sq = 0;
-    for (double t : times_ms) sum_sq += (t - mean_ms) * (t - mean_ms);
-    double std_ms  = std::sqrt(sum_sq / static_cast<double>(repeats));
-
-    std::vector<double> sorted_times = times_ms;
-    std::nth_element(sorted_times.begin(),
-                     sorted_times.begin() + static_cast<std::ptrdiff_t>(repeats / 2),
-                     sorted_times.end());
-    double median_ms = sorted_times[repeats / 2];
-
-    std::size_t p95_idx =
-        static_cast<std::size_t>(static_cast<double>(repeats) * 0.95);
-    if (p95_idx >= repeats) p95_idx = repeats - 1;
-    std::nth_element(sorted_times.begin(),
-                     sorted_times.begin() + static_cast<std::ptrdiff_t>(p95_idx),
-                     sorted_times.end());
-    double p95_ms = sorted_times[p95_idx];
-
-    double peak_mb       = get_peak_rss_mb();
-    bool   hash_match    = (gpu_hash == cpu_hash);
-
-    if (!hash_match)
-        std::cerr << "WARNING: GPU output hash does not match CPU reference\n";
-    if (n_selected_gpu != n_selected_cpu)
-        std::cerr << "WARNING: GPU selected " << n_selected_gpu
-                  << " tracks but CPU selected " << n_selected_cpu << "\n";
-
-    // ------------------------------------------------------------------
-    // Output  (same key names as benchmark_resolver.cpp where applicable)
-    // ------------------------------------------------------------------
     std::cout << "backend=gpu\n"
               << "n_it_max=" << n_it_max << "\n"
               << "adaptive_n_it=" << (adaptive_n_it ? "true" : "false") << "\n"
+              << "parallel_batch_enabled=" << (parallel_batch ? "true" : "false")
+              << "\n"
+              << "parallel_batch_window=" << parallel_batch_window << "\n"
               << "n_candidates=" << n_input
-              << " n_selected=" << n_selected_gpu
-              << " n_removed=" << (n_input - n_selected_gpu) << "\n"
-              << "time_ms_mean="   << mean_ms
-              << " time_ms_std="   << std_ms
-              << " time_ms_median=" << median_ms
-              << " time_ms_p95="   << p95_ms  << "\n"
-              << "events_per_sec=" << (1000.0 / mean_ms) << "\n"
+              << " n_selected_cpu=" << n_selected_cpu << "\n"
+              << "time_h2d_ms=" << h2d_ms << "\n"
               << "peak_memory_mb=" << peak_mb << "\n"
-              << "output_hash="    << gpu_hash << "\n"
-              << "time_h2d_ms="    << h2d_ms   << "\n"
-              << "time_d2h_ms="    << d2h_ms   << "\n"
-              << "cpu_hash="       << cpu_hash  << "\n"
-              << "gpu_hash="       << gpu_hash  << "\n"
-              << "hash_match="     << (hash_match ? "true" : "false") << "\n";
+              << "cpu_hash=" << cpu_hash << "\n"
+              << "cpu_duplicate_rate=" << cpu_dup_rate << "\n";
+
+    dump_backend_metrics(baseline, "baseline_");
+
+    if (pbg) {
+        dump_backend_metrics(*pbg, "pbg_");
+        std::cout << "pbg_n_outer_iterations=" << pbg->batch_sizes.size()
+                  << "\n";
+        if (!pbg->batch_sizes.empty()) {
+            double sum_b = 0.0;
+            unsigned int max_b = 0;
+            for (auto b : pbg->batch_sizes) {
+                sum_b += b;
+                if (b > max_b) max_b = b;
+            }
+            std::cout
+                << "pbg_avg_batch_size="
+                << (sum_b / static_cast<double>(pbg->batch_sizes.size()))
+                << "\n"
+                << "pbg_max_batch_size=" << max_b << "\n";
+        }
+        if (!log_batch_sizes_path.empty()) {
+            std::ofstream f(log_batch_sizes_path);
+            f << "outer_iter,batch_size\n";
+            for (std::size_t i = 0; i < pbg->batch_sizes.size(); ++i) {
+                f << i << "," << pbg->batch_sizes[i] << "\n";
+            }
+            std::cout << "pbg_batch_size_log_written="
+                      << log_batch_sizes_path << "\n";
+        }
+    }
+
+    // Legacy single-backend field names preserved for downstream scripts that
+    // parse the pre-PBG format. They always reflect the baseline run.
+    std::cout << "n_selected=" << baseline.n_selected
+              << " n_removed=" << (n_input - baseline.n_selected) << "\n"
+              << "time_ms_mean=" << baseline.mean_ms
+              << " time_ms_std=" << baseline.std_ms
+              << " time_ms_median=" << baseline.median_ms
+              << " time_ms_p95=" << baseline.p95_ms << "\n"
+              << "events_per_sec=" << (1000.0 / baseline.mean_ms) << "\n"
+              << "output_hash=" << baseline.gpu_hash << "\n"
+              << "time_d2h_ms=" << baseline.d2h_ms << "\n"
+              << "gpu_hash=" << baseline.gpu_hash << "\n"
+              << "hash_match="
+              << (baseline.hash_match ? "true" : "false") << "\n";
+
+    if (!baseline.hash_match)
+        std::cerr << "WARNING: GPU baseline hash does not match CPU reference\n";
+    if (baseline.n_selected != n_selected_cpu)
+        std::cerr << "WARNING: GPU baseline selected " << baseline.n_selected
+                  << " tracks but CPU selected " << n_selected_cpu << "\n";
+    // Keep shims so the rest of the original output block (profile section)
+    // below still compiles.
+    const bool hash_match = baseline.hash_match;
+    const std::string gpu_hash = baseline.gpu_hash;
+    (void)hash_match;
+    (void)gpu_hash;
 
     if (profile_mode) {
         gpu_resolver.set_profiling(true);

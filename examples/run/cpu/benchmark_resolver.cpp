@@ -23,6 +23,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -60,7 +61,7 @@ void fill_pattern(
     }
 }
 
-std::string compute_output_hash(
+std::vector<std::vector<traccc::measurement_id_type>> extract_sorted_patterns(
     const traccc::edm::track_container<traccc::default_algebra>::host& out) {
     std::vector<std::vector<traccc::measurement_id_type>> patterns;
     traccc::edm::measurement_collection<traccc::default_algebra>::const_device
@@ -76,6 +77,30 @@ std::string compute_output_hash(
         patterns.push_back(std::move(p));
     }
     std::sort(patterns.begin(), patterns.end());
+    return patterns;
+}
+
+/// Duplicate rate = (# measurements used by >= 2 accepted tracks) /
+/// (# distinct measurements used by accepted tracks). Identical formula to
+/// the GPU harness so CPU and GPU are directly comparable.
+double duplicate_rate(
+    const std::vector<std::vector<traccc::measurement_id_type>>& patterns) {
+    std::unordered_map<traccc::measurement_id_type, std::size_t> count;
+    for (const auto& p : patterns) {
+        for (auto id : p) ++count[id];
+    }
+    if (count.empty()) return 0.0;
+    std::size_t shared = 0;
+    for (const auto& [_, n] : count) {
+        if (n >= 2) ++shared;
+    }
+    return static_cast<double>(shared) /
+           static_cast<double>(count.size());
+}
+
+std::string compute_output_hash(
+    const traccc::edm::track_container<traccc::default_algebra>::host& out) {
+    const auto patterns = extract_sorted_patterns(out);
     std::ostringstream oss;
     for (const auto& p : patterns) {
         for (auto id : p) oss << id << ",";
@@ -454,6 +479,7 @@ int main(int argc, char* argv[]) {
     std::vector<double> times_ms;
     std::string first_hash;
     std::size_t n_selected = 0;
+    double last_dup_rate = 0.0;
 
     for (std::size_t r = 0; r < repeats; ++r) {
         auto start = std::chrono::high_resolution_clock::now();
@@ -465,6 +491,8 @@ int main(int argc, char* argv[]) {
             std::chrono::duration<double, std::milli>(end - start).count();
         times_ms.push_back(ms);
         n_selected = result.tracks.size();
+        const auto patterns = extract_sorted_patterns(result);
+        last_dup_rate = duplicate_rate(patterns);
         std::string h = compute_output_hash(result);
         if (r == 0) {
             first_hash = h;
@@ -500,7 +528,8 @@ int main(int argc, char* argv[]) {
               << "\n"
               << "events_per_sec=" << (1000.0 / mean_ms) << "\n"
               << "peak_memory_mb=" << peak_mb << "\n"
-              << "output_hash=" << first_hash << "\n";
+              << "output_hash=" << first_hash << "\n"
+              << "duplicate_rate_post=" << last_dup_rate << "\n";
 
     if (profile) {
         // one warmup so caches are warm before the single profiling pass
