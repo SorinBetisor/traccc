@@ -9,6 +9,9 @@
 #include "../utils/cuda_error_handling.hpp"
 #include "../utils/utils.hpp"
 #include "./kernels/add_block_offset.cuh"
+#include "./kernels/apply_batch_removals.cuh"
+#include "./kernels/batch_identify_removals.cuh"
+#include "./kernels/batch_prologue.cuh"
 #include "./kernels/block_inclusive_scan.cuh"
 #include "./kernels/count_shared_measurements.cuh"
 #include "./kernels/fill_inverted_ids.cuh"
@@ -21,6 +24,7 @@
 #include "./kernels/scan_block_offsets.cuh"
 #include "./kernels/sort_tracks_per_measurement.cuh"
 #include "./kernels/sort_updated_tracks.cuh"
+#include "./kernels/update_rel_shared.cuh"
 #include "./kernels/update_status.cuh"
 #include "traccc/cuda/ambiguity_resolution/greedy_ambiguity_resolution_algorithm.hpp"
 #include "traccc/definitions/math.hpp"
@@ -550,6 +554,23 @@ greedy_ambiguity_resolution_algorithm::operator()(
                                                                   m_mr.main};
     m_copy.get().setup(scanned_block_offsets_buffer)->ignore();
 
+    // --- Parallel batch greedy (Tier 2a) buffers. Allocated unconditionally
+    // so sizes are known up front; only populated when m_parallel_batch is
+    // true. Total extra allocation is ~meas_count*sizeof(unsigned) bytes.
+    vecmem::data::vector_buffer<unsigned int> claimed_by_buffer{meas_count,
+                                                                m_mr.main};
+    m_copy.get().setup(claimed_by_buffer)->ignore();
+    vecmem::data::vector_buffer<unsigned int> batch_ids_buffer{n_tracks,
+                                                               m_mr.main};
+    m_copy.get().setup(batch_ids_buffer)->ignore();
+    vecmem::unique_alloc_ptr<unsigned int> batch_size_device =
+        vecmem::make_unique_alloc<unsigned int>(m_mr.main);
+
+    // Per-outer-iteration batch size log (host-side buffer, populated after
+    // each graph_replay burst).
+    std::vector<unsigned int> batch_sizes_this_call;
+    batch_sizes_this_call.reserve(256);
+
     AR_NVTX_PUSH("gpu_ar_eviction_loop");
     // Start the iteration
     while (!terminate && n_accepted > 0) {
@@ -571,31 +592,109 @@ greedy_ambiguity_resolution_algorithm::operator()(
 
         cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
 
-        // Counts the number of removable tracks in the current iteration and
-        // remove them from the track pool
-        kernels::remove_tracks<<<1, 512, 0, stream>>>(
-            device::remove_tracks_payload{
-                .sorted_ids_view = sorted_ids_buffer,
-                .n_accepted = n_accepted_device.get(),
-                .meas_ids_view = meas_ids_buffer,
-                .n_meas_view = n_meas_buffer,
-                .meas_id_to_unique_id_view = meas_id_to_unique_id_buffer,
-                .tracks_per_measurement_view = tracks_per_measurement_buffer,
-                .track_status_per_measurement_view =
-                    track_status_per_measurement_buffer,
-                .n_accepted_tracks_per_measurement_view =
-                    n_accepted_tracks_per_measurement_buffer,
-                .n_shared_view = n_shared_buffer,
-                .rel_shared_view = rel_shared_buffer,
-                .n_removable_tracks = n_removable_tracks_device.get(),
-                .n_meas_to_remove = n_meas_to_remove_device.get(),
-                .terminate = terminate_device.get(),
-                .max_shared = max_shared_device.get(),
-                .n_updated_tracks = n_updated_tracks_device.get(),
-                .updated_tracks_view = updated_tracks_buffer,
-                .is_updated_view = is_updated_buffer,
-                .n_valid_threads = n_valid_threads_device.get(),
-                .track_count_view = track_count_buffer});
+        if (!m_parallel_batch) {
+            // --- Baseline path: single-block batched removal with prefix
+            // conflict-free rule. Unchanged from upstream.
+            kernels::remove_tracks<<<1, 512, 0, stream>>>(
+                device::remove_tracks_payload{
+                    .sorted_ids_view = sorted_ids_buffer,
+                    .n_accepted = n_accepted_device.get(),
+                    .meas_ids_view = meas_ids_buffer,
+                    .n_meas_view = n_meas_buffer,
+                    .meas_id_to_unique_id_view = meas_id_to_unique_id_buffer,
+                    .tracks_per_measurement_view =
+                        tracks_per_measurement_buffer,
+                    .track_status_per_measurement_view =
+                        track_status_per_measurement_buffer,
+                    .n_accepted_tracks_per_measurement_view =
+                        n_accepted_tracks_per_measurement_buffer,
+                    .n_shared_view = n_shared_buffer,
+                    .rel_shared_view = rel_shared_buffer,
+                    .n_removable_tracks = n_removable_tracks_device.get(),
+                    .n_meas_to_remove = n_meas_to_remove_device.get(),
+                    .terminate = terminate_device.get(),
+                    .max_shared = max_shared_device.get(),
+                    .n_updated_tracks = n_updated_tracks_device.get(),
+                    .updated_tracks_view = updated_tracks_buffer,
+                    .is_updated_view = is_updated_buffer,
+                    .n_valid_threads = n_valid_threads_device.get(),
+                    .track_count_view = track_count_buffer});
+        } else {
+            // --- Tier 2a: parallel batch greedy removal. Priority-CAS claim
+            // on contested measurements, confirm + apply, recompute rel_shared
+            // on the survivors. See docs/analysis/parallel_batch_greedy_design
+            // .md Sec. 4.
+            const unsigned int window =
+                std::min(n_accepted, m_parallel_batch_window);
+
+            // Reset claimed_by to UINT_MAX (0xff bytes) for this outer step.
+            cudaMemsetAsync(claimed_by_buffer.ptr(), 0xff,
+                            sizeof(unsigned int) * meas_count, stream);
+
+            kernels::batch_prologue<<<1, 1, 0, stream>>>(
+                device::batch_prologue_payload{
+                    .terminate = terminate_device.get(),
+                    .max_shared = max_shared_device.get(),
+                    .n_updated_tracks = n_updated_tracks_device.get(),
+                    .batch_size = batch_size_device.get()});
+
+            const unsigned int identify_threads = 256u;
+            const unsigned int identify_blocks =
+                (window + identify_threads - 1u) / identify_threads;
+            kernels::batch_identify_removals<<<identify_blocks,
+                                               identify_threads, 0, stream>>>(
+                device::batch_identify_removals_payload{
+                    .sorted_ids_view = sorted_ids_buffer,
+                    .n_accepted = n_accepted_device.get(),
+                    .meas_ids_view = meas_ids_buffer,
+                    .meas_id_to_unique_id_view = meas_id_to_unique_id_buffer,
+                    .n_accepted_tracks_per_measurement_view =
+                        n_accepted_tracks_per_measurement_buffer,
+                    .n_shared_view = n_shared_buffer,
+                    .claimed_by_view = claimed_by_buffer,
+                    .terminate = terminate_device.get(),
+                    .candidate_window_size = window});
+
+            const unsigned int apply_threads = 128u;
+            const unsigned int apply_blocks =
+                (window + apply_threads - 1u) / apply_threads;
+            kernels::apply_batch_removals<<<apply_blocks, apply_threads, 0,
+                                            stream>>>(
+                device::apply_batch_removals_payload{
+                    .sorted_ids_view = sorted_ids_buffer,
+                    .n_accepted = n_accepted_device.get(),
+                    .meas_ids_view = meas_ids_buffer,
+                    .n_meas_view = n_meas_buffer,
+                    .meas_id_to_unique_id_view = meas_id_to_unique_id_buffer,
+                    .tracks_per_measurement_view =
+                        tracks_per_measurement_buffer,
+                    .track_status_per_measurement_view =
+                        track_status_per_measurement_buffer,
+                    .n_accepted_tracks_per_measurement_view =
+                        n_accepted_tracks_per_measurement_buffer,
+                    .n_shared_view = n_shared_buffer,
+                    .rel_shared_view = rel_shared_buffer,
+                    .claimed_by_view = claimed_by_buffer,
+                    .batch_ids_view = batch_ids_buffer,
+                    .batch_size = batch_size_device.get(),
+                    .terminate = terminate_device.get(),
+                    .candidate_window_size = window,
+                    .n_updated_tracks = n_updated_tracks_device.get(),
+                    .updated_tracks_view = updated_tracks_buffer,
+                    .is_updated_view = is_updated_buffer,
+                    .track_count_view = track_count_buffer});
+
+            kernels::update_rel_shared<<<
+                (n_tracks + (m_warp_size * 2) - 1) / (m_warp_size * 2),
+                m_warp_size * 2, 0, stream>>>(
+                device::update_rel_shared_payload{
+                    .terminate = terminate_device.get(),
+                    .n_updated_tracks = n_updated_tracks_device.get(),
+                    .updated_tracks_view = updated_tracks_buffer,
+                    .n_shared_view = n_shared_buffer,
+                    .n_meas_view = n_meas_buffer,
+                    .rel_shared_view = rel_shared_buffer});
+        }
 
         // After the kernel "remove_tracks", sorted_ids_view is not sorted
         // anymore as the number of measurements of a few tracks might change.
@@ -739,10 +838,31 @@ greedy_ambiguity_resolution_algorithm::operator()(
                         cudaMemcpyDeviceToHost, stream);
         cudaMemcpyAsync(&n_accepted, n_accepted_device.get(),
                         sizeof(unsigned int), cudaMemcpyDeviceToHost, stream);
+
+        // Pull back the batch size observed on the last graph replay in this
+        // outer step when PBG logging is requested. The value is the batch
+        // admitted on the final replay only; ncu / nsys traces remain the
+        // source of truth for per-replay detail.
+        unsigned int last_batch = 0u;
+        if (m_parallel_batch && m_batch_size_log != nullptr) {
+            cudaMemcpyAsync(&last_batch, batch_size_device.get(),
+                            sizeof(unsigned int), cudaMemcpyDeviceToHost,
+                            stream);
+        }
         m_stream.get().synchronize();
+        if (m_parallel_batch && m_batch_size_log != nullptr) {
+            batch_sizes_this_call.push_back(last_batch);
+        }
     }
     AR_NVTX_POP();
     perf.mark(6, stream);
+
+    // Publish the per-outer-iteration batch size log once the loop has
+    // finished. Only written when PBG and logging are both enabled.
+    if (m_parallel_batch && m_batch_size_log != nullptr) {
+        m_batch_size_log->assign(batch_sizes_this_call.begin(),
+                                 batch_sizes_this_call.end());
+    }
 
     cudaMemcpyAsync(&n_accepted, n_accepted_device.get(), sizeof(unsigned int),
                     cudaMemcpyDeviceToHost, stream);
