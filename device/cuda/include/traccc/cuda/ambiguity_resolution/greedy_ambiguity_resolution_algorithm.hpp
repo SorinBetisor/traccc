@@ -20,6 +20,9 @@
 // VecMem include(s).
 #include <vecmem/utils/copy.hpp>
 
+// System include(s).
+#include <vector>
+
 namespace traccc::cuda {
 
 /// Per-phase GPU timing data populated when set_profiling(true) is active.
@@ -89,6 +92,29 @@ class greedy_ambiguity_resolution_algorithm
     /// Set to false to force a fixed m_n_it_max every outer step.
     void set_adaptive_n_it(bool on) { m_adaptive_n_it = on; }
 
+    /// Enable the parallel-batch-greedy (Tier 2a) removal path.
+    /// When true, the baseline single-block remove_tracks kernel is replaced
+    /// by the two-kernel pair batch_identify_removals + apply_batch_removals,
+    /// which picks a greedy MIS of the track-track conflict graph and removes
+    /// all batch members in one outer iteration. Default: false (baseline).
+    /// See docs/analysis/parallel_batch_greedy_design.md for the algorithm.
+    void set_parallel_batch_mode(bool on) { m_parallel_batch = on; }
+
+    /// Upper bound on how many tail candidates of sorted_ids are scanned per
+    /// outer iteration in parallel-batch mode. Larger values allow bigger
+    /// batches at the cost of more work when the input is already sparse.
+    /// Default: 8192. Only consulted when m_parallel_batch == true.
+    void set_parallel_batch_window(unsigned int w) {
+        m_parallel_batch_window = w;
+    }
+
+    /// When parallel-batch mode is enabled, write the per-outer-iteration
+    /// batch sizes to this host vector after each operator() call. Caller
+    /// owns the vector; pass nullptr to disable. Default: nullptr.
+    void set_batch_size_log(std::vector<unsigned int>* out) {
+        m_batch_size_log = out;
+    }
+
     private:
     /// Algorithm configuration
     config_type m_config;
@@ -104,6 +130,9 @@ class greedy_ambiguity_resolution_algorithm
     mutable gpu_profile_data_t m_last_profile{};
     unsigned int               m_n_it_max{100u};
     bool                       m_adaptive_n_it{true};
+    bool                       m_parallel_batch{false};
+    unsigned int               m_parallel_batch_window{8192u};
+    mutable std::vector<unsigned int>* m_batch_size_log{nullptr};
 };
 
 }  // namespace traccc::cuda
