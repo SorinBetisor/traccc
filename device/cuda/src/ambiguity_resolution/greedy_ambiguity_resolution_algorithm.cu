@@ -39,12 +39,12 @@
 
 // NVTX range helpers — zero overhead when no profiler is attached.
 #if __has_include("nvtx3/nvToolsExt.h")
-#    include "nvtx3/nvToolsExt.h"
-#    define AR_NVTX_PUSH(name) nvtxRangePushA(name)
-#    define AR_NVTX_POP()      nvtxRangePop()
+#include "nvtx3/nvToolsExt.h"
+#define AR_NVTX_PUSH(name) nvtxRangePushA(name)
+#define AR_NVTX_POP() nvtxRangePop()
 #else
-#    define AR_NVTX_PUSH(name) ((void)0)
-#    define AR_NVTX_POP()      ((void)0)
+#define AR_NVTX_PUSH(name) ((void)0)
+#define AR_NVTX_POP() ((void)0)
 #endif
 
 // Thrust include(s).
@@ -55,9 +55,9 @@
 #include <thrust/functional.h>
 #include <thrust/iterator/constant_iterator.h>
 #include <thrust/iterator/counting_iterator.h>
-#include <thrust/scatter.h>
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
+#include <thrust/scatter.h>
 #include <thrust/sort.h>
 #include <thrust/transform.h>
 #include <thrust/unique.h>
@@ -70,23 +70,29 @@ struct PerfEvents {
     bool active;
 
     PerfEvents(bool on, cudaStream_t s) : active(on) {
-        if (!active) return;
-        for (auto& e : ev) cudaEventCreate(&e);
+        if (!active)
+            return;
+        for (auto& e : ev)
+            cudaEventCreate(&e);
         cudaEventRecord(ev[0], s);
     }
 
     ~PerfEvents() {
-        if (!active) return;
-        for (auto& e : ev) cudaEventDestroy(e);
+        if (!active)
+            return;
+        for (auto& e : ev)
+            cudaEventDestroy(e);
     }
 
     void mark(int idx, cudaStream_t s) {
-        if (active) cudaEventRecord(ev[idx], s);
+        if (active)
+            cudaEventRecord(ev[idx], s);
     }
 
     float elapsed(int a, int b) const {
         float ms = 0.f;
-        if (active) cudaEventElapsedTime(&ms, ev[a], ev[b]);
+        if (active)
+            cudaEventElapsedTime(&ms, ev[a], ev[b]);
         return ms;
     }
 };
@@ -485,7 +491,8 @@ greedy_ambiguity_resolution_algorithm::operator()(
     thrust::sort(thrust_policy, sorted_ids_buffer.ptr(),
                  sorted_ids_buffer.ptr() + n_accepted, trk_comp);
 
-    if (m_profiling) m_stream.get().synchronize();
+    if (m_profiling)
+        m_stream.get().synchronize();
     AR_NVTX_POP();
     perf.mark(5, stream);
 
@@ -714,10 +721,8 @@ greedy_ambiguity_resolution_algorithm::operator()(
             // rearrangement); in graph mode we need a full rebuild every
             // outer iteration, so we scatter via thrust directly.
             {
-                auto ci_begin =
-                    thrust::counting_iterator<unsigned int>(0u);
-                thrust::scatter(thrust_policy, ci_begin,
-                                ci_begin + n_accepted,
+                auto ci_begin = thrust::counting_iterator<unsigned int>(0u);
+                thrust::scatter(thrust_policy, ci_begin, ci_begin + n_accepted,
                                 sorted_ids_buffer.ptr(),
                                 inverted_ids_buffer.ptr());
             }
@@ -759,15 +764,14 @@ greedy_ambiguity_resolution_algorithm::operator()(
                 // Build row_ptr[0..n_tracks]. row_ptr[v] = number of edges
                 // with src < v (== lower_bound position of v in sorted src).
                 auto ci_begin = thrust::counting_iterator<unsigned int>(0u);
-                thrust::lower_bound(
-                    thrust_policy, coo_src_buffer.ptr(),
-                    coo_src_buffer.ptr() + n_edges_host, ci_begin,
-                    ci_begin + (n_tracks + 1u), row_ptr_buffer.ptr());
+                thrust::lower_bound(thrust_policy, coo_src_buffer.ptr(),
+                                    coo_src_buffer.ptr() + n_edges_host,
+                                    ci_begin, ci_begin + (n_tracks + 1u),
+                                    row_ptr_buffer.ptr());
             } else {
                 // No edges: row_ptr is all zeros. Still safe to launch MIS.
                 cudaMemsetAsync(row_ptr_buffer.ptr(), 0,
-                                sizeof(unsigned int) * (n_tracks + 1u),
-                                stream);
+                                sizeof(unsigned int) * (n_tracks + 1u), stream);
             }
 
             // Initialise MIS state from the current iteration.
@@ -805,9 +809,9 @@ greedy_ambiguity_resolution_algorithm::operator()(
                     // Host-side convergence check. Synchronise so that the
                     // flag reflects this round's result.
                     int undecided_host = 0;
-                    cudaMemcpyAsync(&undecided_host,
-                                    any_undecided_device.get(), sizeof(int),
-                                    cudaMemcpyDeviceToHost, stream);
+                    cudaMemcpyAsync(&undecided_host, any_undecided_device.get(),
+                                    sizeof(int), cudaMemcpyDeviceToHost,
+                                    stream);
                     m_stream.get().synchronize();
                     if (undecided_host == 0) {
                         break;
@@ -838,9 +842,9 @@ greedy_ambiguity_resolution_algorithm::operator()(
                     .n_vertices = n_tracks});
 
             // Recompute rel_shared for survivors whose n_shared changed.
-            kernels::update_rel_shared<<<
-                (n_tracks + (m_warp_size * 2) - 1) / (m_warp_size * 2),
-                m_warp_size * 2, 0, stream>>>(
+            kernels::update_rel_shared<<<(n_tracks + (m_warp_size * 2) - 1) /
+                                             (m_warp_size * 2),
+                                         m_warp_size * 2, 0, stream>>>(
                 device::update_rel_shared_payload{
                     .terminate = terminate_device.get(),
                     .n_updated_tracks = n_updated_tracks_device.get(),
@@ -913,8 +917,7 @@ greedy_ambiguity_resolution_algorithm::operator()(
                 // during apply_graph_removals) as the reset target.
                 {
                     const unsigned int nt = nThreads_adaptive;
-                    const unsigned int nb_upd =
-                        (n_tracks + nt - 1) / nt;
+                    const unsigned int nb_upd = (n_tracks + nt - 1) / nt;
                     (void)nb_upd;
                 }
                 cudaMemsetAsync(is_updated_buffer.ptr(), 0,
@@ -929,13 +932,12 @@ greedy_ambiguity_resolution_algorithm::operator()(
                 cudaMemsetAsync(max_shared_device.get(), 0,
                                 sizeof(unsigned int), stream);
 
-                auto max_it = thrust::max_element(thrust_policy,
-                                                  n_shared_buffer.ptr(),
-                                                  n_shared_buffer.ptr() +
-                                                      n_tracks);
+                auto max_it =
+                    thrust::max_element(thrust_policy, n_shared_buffer.ptr(),
+                                        n_shared_buffer.ptr() + n_tracks);
                 cudaMemcpyAsync(max_shared_device.get(), max_it,
-                                sizeof(unsigned int),
-                                cudaMemcpyDeviceToDevice, stream);
+                                sizeof(unsigned int), cudaMemcpyDeviceToDevice,
+                                stream);
             }
 
             // Pull back iteration summary. Terminate when no track was
@@ -1049,20 +1051,21 @@ greedy_ambiguity_resolution_algorithm::operator()(
             const unsigned int confirm_threads = 256u;
             const unsigned int confirm_blocks =
                 (window + confirm_threads - 1u) / confirm_threads;
-            kernels::batch_confirm<<<confirm_blocks, confirm_threads, 0,
-                                     stream>>>(
-                device::batch_confirm_payload{
-                    .sorted_ids_view = sorted_ids_buffer,
-                    .n_accepted = n_acc_snapshot_device.get(),
-                    .meas_ids_view = meas_ids_buffer,
-                    .meas_id_to_unique_id_view = meas_id_to_unique_id_buffer,
-                    .n_accepted_tracks_per_measurement_view =
-                        n_accepted_tracks_per_measurement_buffer,
-                    .n_shared_view = n_shared_buffer,
-                    .claimed_by_view = claimed_by_buffer,
-                    .terminate = terminate_device.get(),
-                    .candidate_window_size = window,
-                    .first_fail = first_fail_device.get()});
+            kernels::
+                batch_confirm<<<confirm_blocks, confirm_threads, 0, stream>>>(
+                    device::batch_confirm_payload{
+                        .sorted_ids_view = sorted_ids_buffer,
+                        .n_accepted = n_acc_snapshot_device.get(),
+                        .meas_ids_view = meas_ids_buffer,
+                        .meas_id_to_unique_id_view =
+                            meas_id_to_unique_id_buffer,
+                        .n_accepted_tracks_per_measurement_view =
+                            n_accepted_tracks_per_measurement_buffer,
+                        .n_shared_view = n_shared_buffer,
+                        .claimed_by_view = claimed_by_buffer,
+                        .terminate = terminate_device.get(),
+                        .candidate_window_size = window,
+                        .first_fail = first_fail_device.get()});
 
             const unsigned int apply_threads = 128u;
             const unsigned int apply_blocks =
@@ -1104,9 +1107,9 @@ greedy_ambiguity_resolution_algorithm::operator()(
                     .n_accepted = n_accepted_device.get(),
                     .batch_size = batch_size_device.get()});
 
-            kernels::update_rel_shared<<<
-                (n_tracks + (m_warp_size * 2) - 1) / (m_warp_size * 2),
-                m_warp_size * 2, 0, stream>>>(
+            kernels::update_rel_shared<<<(n_tracks + (m_warp_size * 2) - 1) /
+                                             (m_warp_size * 2),
+                                         m_warp_size * 2, 0, stream>>>(
                 device::update_rel_shared_payload{
                     .terminate = terminate_device.get(),
                     .n_updated_tracks = n_updated_tracks_device.get(),
@@ -1330,14 +1333,14 @@ greedy_ambiguity_resolution_algorithm::operator()(
 
     if (m_profiling) {
         cudaStreamSynchronize(stream);
-        m_last_profile.filter_setup_ms          = perf.elapsed(0, 1);
-        m_last_profile.unique_meas_ms           = perf.elapsed(1, 2);
-        m_last_profile.inverted_index_ms        = perf.elapsed(2, 3);
-        m_last_profile.shared_count_ms          = perf.elapsed(3, 4);
-        m_last_profile.initial_sort_ms          = perf.elapsed(4, 5);
-        m_last_profile.eviction_loop_ms         = perf.elapsed(5, 6);
-        m_last_profile.output_copy_ms           = perf.elapsed(6, 7);
-        m_last_profile.eviction_graph_launches  = n_graph_launches;
+        m_last_profile.filter_setup_ms = perf.elapsed(0, 1);
+        m_last_profile.unique_meas_ms = perf.elapsed(1, 2);
+        m_last_profile.inverted_index_ms = perf.elapsed(2, 3);
+        m_last_profile.shared_count_ms = perf.elapsed(3, 4);
+        m_last_profile.initial_sort_ms = perf.elapsed(4, 5);
+        m_last_profile.eviction_loop_ms = perf.elapsed(5, 6);
+        m_last_profile.output_copy_ms = perf.elapsed(6, 7);
+        m_last_profile.eviction_graph_launches = n_graph_launches;
     }
 
     return res_track_candidates_buffer;

@@ -111,17 +111,15 @@ __global__ void apply_batch_removals(
         auto status_on_u = track_status_per_measurement[u];
 
         // Flip my own status slot in the jagged tracks_per_measurement row.
-        const unsigned int my_idx =
-            static_cast<unsigned int>(thrust::lower_bound(thrust::seq,
-                                                          tracks_on_u.begin(),
-                                                          tracks_on_u.end(),
-                                                          t) -
-                                      tracks_on_u.begin());
+        const unsigned int my_idx = static_cast<unsigned int>(
+            thrust::lower_bound(thrust::seq, tracks_on_u.begin(),
+                                tracks_on_u.end(), t) -
+            tracks_on_u.begin());
         status_on_u[my_idx] = 0;
 
         // Decrement the count of accepted tracks on this measurement.
-        const unsigned int prev_count = atomicSub(
-            &n_accepted_tracks_per_meas[u], 1u);
+        const unsigned int prev_count =
+            atomicSub(&n_accepted_tracks_per_meas[u], 1u);
 
         // prev_count is the value BEFORE this decrement. If it was 2, exactly
         // one accepted track remains on this measurement and its n_shared is
@@ -148,16 +146,16 @@ __global__ void apply_batch_removals(
             // Number of times measurement u appears in the survivor's meas
             // list. Typically 1, but be safe.
             const auto& alive_mids = meas_ids[alive];
-            const unsigned int m_count = static_cast<unsigned int>(
-                thrust::count(thrust::seq, alive_mids.begin(),
-                              alive_mids.end(), mid));
+            const unsigned int m_count =
+                static_cast<unsigned int>(thrust::count(
+                    thrust::seq, alive_mids.begin(), alive_mids.end(), mid));
 
             atomicSub(&n_shared[alive], m_count);
 
             // Enqueue the survivor exactly once across the grid.
             if (atomicCAS(&is_updated[alive], 0, 1) == 0) {
-                const unsigned int pos = atomicAdd(payload.n_updated_tracks,
-                                                   1u);
+                const unsigned int pos =
+                    atomicAdd(payload.n_updated_tracks, 1u);
                 updated_tracks[pos] = alive;
             }
         }

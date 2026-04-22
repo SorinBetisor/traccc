@@ -17,8 +17,7 @@
 
 namespace traccc::cuda::kernels {
 
-__global__ void update_rel_shared(
-    device::update_rel_shared_payload payload) {
+__global__ void update_rel_shared(device::update_rel_shared_payload payload) {
 
     if (*(payload.terminate) == 1) {
         return;
@@ -39,9 +38,8 @@ __global__ void update_rel_shared(
 
     const unsigned int t = updated_tracks[globalIndex];
 
-    rel_shared[t] = math::div_ieee754(
-        static_cast<traccc::scalar>(n_shared[t]),
-        static_cast<traccc::scalar>(n_meas[t]));
+    rel_shared[t] = math::div_ieee754(static_cast<traccc::scalar>(n_shared[t]),
+                                      static_cast<traccc::scalar>(n_meas[t]));
 }
 
 }  // namespace traccc::cuda::kernels

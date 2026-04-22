@@ -77,16 +77,14 @@ __global__ void apply_graph_removals(
         auto tracks_on_u = tracks_per_measurement[u];
         auto status_on_u = track_status_per_measurement[u];
 
-        const unsigned int my_idx =
-            static_cast<unsigned int>(thrust::lower_bound(thrust::seq,
-                                                          tracks_on_u.begin(),
-                                                          tracks_on_u.end(),
-                                                          t) -
-                                      tracks_on_u.begin());
+        const unsigned int my_idx = static_cast<unsigned int>(
+            thrust::lower_bound(thrust::seq, tracks_on_u.begin(),
+                                tracks_on_u.end(), t) -
+            tracks_on_u.begin());
         status_on_u[my_idx] = 0;
 
-        const unsigned int prev_count = atomicSub(
-            &n_accepted_tracks_per_meas[u], 1u);
+        const unsigned int prev_count =
+            atomicSub(&n_accepted_tracks_per_meas[u], 1u);
 
         if (prev_count == 2u) {
             int alive_idx = -1;
@@ -104,9 +102,9 @@ __global__ void apply_graph_removals(
 
             const unsigned int alive = tracks_on_u[alive_idx];
             const auto& alive_mids = meas_ids[alive];
-            const unsigned int m_count = static_cast<unsigned int>(
-                thrust::count(thrust::seq, alive_mids.begin(),
-                              alive_mids.end(), mid));
+            const unsigned int m_count =
+                static_cast<unsigned int>(thrust::count(
+                    thrust::seq, alive_mids.begin(), alive_mids.end(), mid));
             atomicSub(&n_shared[alive], m_count);
 
             if (atomicCAS(&is_updated[alive], 0, 1) == 0) {

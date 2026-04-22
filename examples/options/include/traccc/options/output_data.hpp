@@ -28,7 +28,8 @@ class output_data : public interface {
     traccc::data_format format = data_format::csv;
     /// Directory of the input files
     std::string directory = "testing/";
-    /// If non-empty, dump ambiguity-resolution input to this path before resolution
+    /// If non-empty, dump ambiguity-resolution input to this path before
+    /// resolution
     std::string dump_ambiguity_input = "";
 
     /// @}

@@ -7,13 +7,12 @@
 
 #pragma once
 
-#include "traccc/ambiguity_resolution/ambiguity_resolution_config.hpp"
-#include "traccc/edm/track_container.hpp"
-
+#include <string_view>
 #include <vecmem/memory/memory_resource.hpp>
 #include <vecmem/utils/copy.hpp>
 
-#include <string_view>
+#include "traccc/ambiguity_resolution/ambiguity_resolution_config.hpp"
+#include "traccc/edm/track_container.hpp"
 
 namespace traccc::io {
 
@@ -26,10 +25,9 @@ inline void write_ambiguity_input(
     std::string_view path,
     const edm::track_container<default_algebra>::const_data& tracks,
     const ambiguity_resolution_config& config) {
-    write_ambiguity_input(path,
-                         edm::track_container<default_algebra>::const_view{
-                             tracks},
-                         config);
+    write_ambiguity_input(
+        path, edm::track_container<default_algebra>::const_view{tracks},
+        config);
 }
 
 struct ambiguity_input_data {

@@ -19,8 +19,7 @@ namespace traccc::cuda::kernels {
 /// directed pair list. With blockDim.x threads per measurement and a fast
 /// shared-memory gather, n_m <= blockDim.x measurements are handled in a
 /// single iteration; larger rows loop.
-__global__ void build_conflict_coo(
-    device::build_conflict_coo_payload payload) {
+__global__ void build_conflict_coo(device::build_conflict_coo_payload payload) {
 
     const unsigned int u = blockIdx.x;
     if (u >= payload.meas_count) {

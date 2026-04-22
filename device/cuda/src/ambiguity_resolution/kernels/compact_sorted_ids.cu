@@ -27,8 +27,7 @@ __global__ void compact_sorted_ids(device::compact_sorted_ids_payload payload) {
 
     vecmem::device_vector<const unsigned int> sorted_ids(
         payload.sorted_ids_view);
-    vecmem::device_vector<const int> keep_flag(
-        payload.keep_flag_per_slot_view);
+    vecmem::device_vector<const int> keep_flag(payload.keep_flag_per_slot_view);
     vecmem::device_vector<const int> keep_prefix(payload.keep_prefix_sums_view);
     vecmem::device_vector<unsigned int> compacted(
         payload.compacted_sorted_ids_view);

@@ -28,15 +28,15 @@ namespace traccc::cuda {
 
 /// Per-phase GPU timing data populated when set_profiling(true) is active.
 struct gpu_profile_data_t {
-    float filter_setup_ms    = 0.f;
-    float unique_meas_ms     = 0.f;
-    float inverted_index_ms  = 0.f;
-    float shared_count_ms    = 0.f;
-    float initial_sort_ms    = 0.f;
-    float eviction_loop_ms   = 0.f;
-    float output_copy_ms     = 0.f;
+    float filter_setup_ms = 0.f;
+    float unique_meas_ms = 0.f;
+    float inverted_index_ms = 0.f;
+    float shared_count_ms = 0.f;
+    float initial_sort_ms = 0.f;
+    float eviction_loop_ms = 0.f;
+    float output_copy_ms = 0.f;
     unsigned int eviction_graph_launches = 0u;
-    unsigned int unique_meas_count       = 0u;
+    unsigned int unique_meas_count = 0u;
 };
 
 /// Evicts tracks that seem to be duplicates or fakes. This algorithm takes a
@@ -118,7 +118,8 @@ class greedy_ambiguity_resolution_algorithm
 
     /// Tier 2c: algorithm selector for the explicit-conflict-graph path.
     ///   NONE      — disable explicit conflict graph (fall through to the
-    ///               PBG or baseline path, depending on set_parallel_batch_mode).
+    ///               PBG or baseline path, depending on
+    ///               set_parallel_batch_mode).
     ///   LUBY_MIS  — build the explicit CSR conflict graph once per outer
     ///               iteration and run Luby-style maximal independent set
     ///               with deterministic priority (lowest sorted-rank wins).
@@ -142,8 +143,8 @@ class greedy_ambiguity_resolution_algorithm
     /// Per-outer-iteration number of vertices / edges in the conflict graph
     /// that was built. Hooked when conflict_graph_mode is not NONE. Caller
     /// owns storage; pass nullptr to disable. Default: nullptr.
-    void set_graph_size_log(std::vector<std::pair<unsigned int,
-                                                   unsigned int>>* out) {
+    void set_graph_size_log(
+        std::vector<std::pair<unsigned int, unsigned int>>* out) {
         m_graph_size_log = out;
     }
 
@@ -158,14 +159,14 @@ class greedy_ambiguity_resolution_algorithm
     std::reference_wrapper<stream> m_stream;
     /// Warp size of the GPU being used
     unsigned int m_warp_size;
-    mutable bool               m_profiling{false};
+    mutable bool m_profiling{false};
     mutable gpu_profile_data_t m_last_profile{};
-    unsigned int               m_n_it_max{100u};
-    bool                       m_adaptive_n_it{true};
-    bool                       m_parallel_batch{false};
-    unsigned int               m_parallel_batch_window{8192u};
+    unsigned int m_n_it_max{100u};
+    bool m_adaptive_n_it{true};
+    bool m_parallel_batch{false};
+    unsigned int m_parallel_batch_window{8192u};
     mutable std::vector<unsigned int>* m_batch_size_log{nullptr};
-    graph_algo_t               m_graph_algo{graph_algo_t::NONE};
+    graph_algo_t m_graph_algo{graph_algo_t::NONE};
     mutable std::vector<unsigned int>* m_graph_batch_log{nullptr};
     mutable std::vector<std::pair<unsigned int, unsigned int>>*
         m_graph_size_log{nullptr};

@@ -5,18 +5,6 @@
  * cpu_hash, gpu_hash, hash_match.
  */
 
-#include "traccc/ambiguity_resolution/ambiguity_resolution_config.hpp"
-#include "traccc/ambiguity_resolution/greedy_ambiguity_resolution_algorithm.hpp"
-#include "traccc/cuda/ambiguity_resolution/greedy_ambiguity_resolution_algorithm.hpp"
-#include "traccc/cuda/utils/stream.hpp"
-#include "traccc/edm/track_container.hpp"
-#include "traccc/io/ambiguity_io.hpp"
-#include "traccc/utils/memory_resource.hpp"
-
-#include <vecmem/memory/cuda/device_memory_resource.hpp>
-#include <vecmem/memory/host_memory_resource.hpp>
-#include <vecmem/utils/cuda/async_copy.hpp>
-
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -29,7 +17,18 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <vecmem/memory/cuda/device_memory_resource.hpp>
+#include <vecmem/memory/host_memory_resource.hpp>
+#include <vecmem/utils/cuda/async_copy.hpp>
 #include <vector>
+
+#include "traccc/ambiguity_resolution/ambiguity_resolution_config.hpp"
+#include "traccc/ambiguity_resolution/greedy_ambiguity_resolution_algorithm.hpp"
+#include "traccc/cuda/ambiguity_resolution/greedy_ambiguity_resolution_algorithm.hpp"
+#include "traccc/cuda/utils/stream.hpp"
+#include "traccc/edm/track_container.hpp"
+#include "traccc/io/ambiguity_io.hpp"
+#include "traccc/utils/memory_resource.hpp"
 
 #ifdef __linux__
 #include <sys/resource.h>
@@ -37,9 +36,8 @@
 
 namespace {
 
-void fill_measurements(
-    traccc::edm::measurement_collection::host& m,
-    traccc::measurement_id_type max_id) {
+void fill_measurements(traccc::edm::measurement_collection::host& m,
+                       traccc::measurement_id_type max_id) {
     m.reserve(max_id + 1);
     for (traccc::measurement_id_type i = 0; i <= max_id; i++) {
         m.push_back({});
@@ -53,8 +51,7 @@ void fill_pattern(
     const std::vector<traccc::measurement_id_type>& pattern) {
     tc.tracks.resize(tc.tracks.size() + 1u);
     tc.tracks.pval().back() = pval;
-    traccc::edm::measurement_collection::const_device
-        meas{tc.measurements};
+    traccc::edm::measurement_collection::const_device meas{tc.measurements};
     for (traccc::measurement_id_type meas_id : pattern) {
         auto it = std::lower_bound(meas.identifier().begin(),
                                    meas.identifier().end(), meas_id);
@@ -70,8 +67,7 @@ void fill_pattern(
 std::string compute_hash_host(
     const traccc::edm::track_container<traccc::default_algebra>::host& out) {
     std::vector<std::vector<traccc::measurement_id_type>> patterns;
-    traccc::edm::measurement_collection::const_device
-        meas{out.measurements};
+    traccc::edm::measurement_collection::const_device meas{out.measurements};
     for (std::size_t i = 0; i < out.tracks.size(); ++i) {
         std::vector<traccc::measurement_id_type> p;
         for (const auto& [type, idx] : out.tracks.at(i).constituent_links()) {
@@ -84,7 +80,8 @@ std::string compute_hash_host(
     std::sort(patterns.begin(), patterns.end());
     std::ostringstream oss;
     for (const auto& p : patterns) {
-        for (auto id : p) oss << id << ",";
+        for (auto id : p)
+            oss << id << ",";
         oss << ";";
     }
     return std::to_string(std::hash<std::string>{}(oss.str()));
@@ -99,8 +96,8 @@ std::string compute_hash_buffer(
     const traccc::edm::measurement_collection::const_device meas{
         buf.measurements};
     std::vector<std::vector<traccc::measurement_id_type>> patterns;
-    for (std::uint32_t i = 0;
-         i < static_cast<std::uint32_t>(dev.tracks.size()); ++i) {
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(dev.tracks.size());
+         ++i) {
         std::vector<traccc::measurement_id_type> p;
         for (const auto& [type, idx] : dev.tracks.at(i).constituent_links()) {
             if (type == traccc::edm::track_constituent_link::measurement)
@@ -112,7 +109,8 @@ std::string compute_hash_buffer(
     std::sort(patterns.begin(), patterns.end());
     std::ostringstream oss;
     for (const auto& p : patterns) {
-        for (auto id : p) oss << id << ",";
+        for (auto id : p)
+            oss << id << ",";
         oss << ";";
     }
     return std::to_string(std::hash<std::string>{}(oss.str()));
@@ -124,8 +122,7 @@ std::string compute_hash_buffer(
 std::set<std::vector<traccc::measurement_id_type>> extract_patterns_host(
     const traccc::edm::track_container<traccc::default_algebra>::host& out) {
     std::set<std::vector<traccc::measurement_id_type>> patterns;
-    traccc::edm::measurement_collection::const_device
-        meas{out.measurements};
+    traccc::edm::measurement_collection::const_device meas{out.measurements};
     for (std::size_t i = 0; i < out.tracks.size(); ++i) {
         std::vector<traccc::measurement_id_type> p;
         for (const auto& [type, idx] : out.tracks.at(i).constituent_links()) {
@@ -145,8 +142,8 @@ std::set<std::vector<traccc::measurement_id_type>> extract_patterns_buffer(
         buf};
     const traccc::edm::measurement_collection::const_device meas{
         buf.measurements};
-    for (std::uint32_t i = 0;
-         i < static_cast<std::uint32_t>(dev.tracks.size()); ++i) {
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(dev.tracks.size());
+         ++i) {
         std::vector<traccc::measurement_id_type> p;
         for (const auto& [type, idx] : dev.tracks.at(i).constituent_links()) {
             if (type == traccc::edm::track_constituent_link::measurement)
@@ -173,8 +170,7 @@ double track_selection_overlap(
             ++inter;
         }
     }
-    return static_cast<double>(inter) /
-           static_cast<double>(cpu.size());
+    return static_cast<double>(inter) / static_cast<double>(cpu.size());
 }
 
 /// Post-resolve duplicate rate = (# measurement slots that are shared by >= 2
@@ -198,8 +194,7 @@ double duplicate_rate(
             ++shared;
         }
     }
-    return static_cast<double>(shared) /
-           static_cast<double>(count.size());
+    return static_cast<double>(shared) / static_cast<double>(count.size());
 }
 
 double get_peak_rss_mb() {
@@ -215,19 +210,19 @@ double get_peak_rss_mb() {
 
 int main(int argc, char* argv[]) {
     std::string input_dump;
-    bool synthetic       = false;
-    std::size_t n_candidates   = 10000;
+    bool synthetic = false;
+    std::size_t n_candidates = 10000;
     std::string conflict_density = "med";
-    std::size_t repeats  = 10;
-    std::size_t warmup   = 3;
-    bool profile_mode    = false;
-    unsigned int n_it_max    = 100u;
-    bool adaptive_n_it       = true;
-    bool parallel_batch      = false;
+    std::size_t repeats = 10;
+    std::size_t warmup = 3;
+    bool profile_mode = false;
+    unsigned int n_it_max = 100u;
+    bool adaptive_n_it = true;
+    bool parallel_batch = false;
     unsigned int parallel_batch_window = 8192u;
     std::string log_batch_sizes_path;
-    bool run_graph_mis       = false;
-    bool run_graph_jp        = false;
+    bool run_graph_mis = false;
+    bool run_graph_jp = false;
     std::string log_graph_sizes_path;
     std::string log_graph_batches_path;
 
@@ -250,61 +245,72 @@ int main(int argc, char* argv[]) {
         else if (arg.find("--n-it=") == 0) {
             n_it_max = static_cast<unsigned int>(std::stoull(arg.substr(7)));
             adaptive_n_it = false;
-        }
-        else if (arg == "--parallel-batch")
+        } else if (arg == "--parallel-batch")
             parallel_batch = true;
         else if (arg.find("--parallel-batch-window=") == 0) {
-            parallel_batch_window = static_cast<unsigned int>(
-                std::stoull(arg.substr(24)));
+            parallel_batch_window =
+                static_cast<unsigned int>(std::stoull(arg.substr(24)));
             parallel_batch = true;
-        }
-        else if (arg.find("--log-batch-sizes=") == 0) {
+        } else if (arg.find("--log-batch-sizes=") == 0) {
             log_batch_sizes_path = arg.substr(18);
             parallel_batch = true;
-        }
-        else if (arg.find("--conflict-graph=") == 0) {
+        } else if (arg.find("--conflict-graph=") == 0) {
             std::string v = arg.substr(17);
-            if (v == "mis") { run_graph_mis = true; }
-            else if (v == "jp") { run_graph_jp = true; }
-            else if (v == "both") { run_graph_mis = true; run_graph_jp = true; }
-            else {
+            if (v == "mis") {
+                run_graph_mis = true;
+            } else if (v == "jp") {
+                run_graph_jp = true;
+            } else if (v == "both") {
+                run_graph_mis = true;
+                run_graph_jp = true;
+            } else {
                 std::cerr << "unknown --conflict-graph value: " << v << "\n";
                 return 2;
             }
-        }
-        else if (arg.find("--log-graph-sizes=") == 0) {
+        } else if (arg.find("--log-graph-sizes=") == 0) {
             log_graph_sizes_path = arg.substr(18);
-        }
-        else if (arg.find("--log-graph-batches=") == 0) {
+        } else if (arg.find("--log-graph-batches=") == 0) {
             log_graph_batches_path = arg.substr(20);
-        }
-        else if (arg == "--help" || arg == "-h") {
+        } else if (arg == "--help" || arg == "-h") {
             std::cout
-                << "benchmark_resolver_cuda: GPU greedy ambiguity resolver benchmark\n"
+                << "benchmark_resolver_cuda: GPU greedy ambiguity resolver "
+                   "benchmark\n"
                 << "  --input-dump=<path>   Load pre-frozen JSON dump\n"
                 << "  --synthetic           Generate synthetic input\n"
-                << "  --n-candidates=N      Track candidates for synthetic mode (default 10000)\n"
+                << "  --n-candidates=N      Track candidates for synthetic "
+                   "mode (default 10000)\n"
                 << "  --conflict-density=   low|med|high (default med)\n"
                 << "  --repeats=N           Timed iterations (default 10)\n"
                 << "  --warmup=N            Warmup iterations (default 3)\n"
-                << "  --n-it=N              Fix eviction inner-loop iterations to N (disables adaptive)\n"
-                << "  --profile             Run one extra call with per-phase CUDA event timing\n"
-                << "  --parallel-batch      Also run the Tier 2a parallel batch greedy path\n"
-                << "  --parallel-batch-window=N   Candidate window size for PBG (default 8192)\n"
-                << "  --log-batch-sizes=<path.csv>  Write per-outer-iteration batch sizes to CSV\n"
-                << "  --conflict-graph=mis|jp|both  Tier 2c explicit-conflict-graph runs\n"
-                << "  --log-graph-batches=<path.csv> Write Tier 2c per-iter batch sizes\n"
-                << "  --log-graph-sizes=<path.csv>  Write Tier 2c per-iter |V|,|E|\n"
+                << "  --n-it=N              Fix eviction inner-loop iterations "
+                   "to N (disables adaptive)\n"
+                << "  --profile             Run one extra call with per-phase "
+                   "CUDA event timing\n"
+                << "  --parallel-batch      Also run the Tier 2a parallel "
+                   "batch greedy path\n"
+                << "  --parallel-batch-window=N   Candidate window size for "
+                   "PBG (default 8192)\n"
+                << "  --log-batch-sizes=<path.csv>  Write per-outer-iteration "
+                   "batch sizes to CSV\n"
+                << "  --conflict-graph=mis|jp|both  Tier 2c "
+                   "explicit-conflict-graph runs\n"
+                << "  --log-graph-batches=<path.csv> Write Tier 2c per-iter "
+                   "batch sizes\n"
+                << "  --log-graph-sizes=<path.csv>  Write Tier 2c per-iter "
+                   "|V|,|E|\n"
                 << "\nAdaptive n_it (default, no --n-it):\n"
                 << "  n_it per outer step = max(1, min(100, n_accepted/50))\n"
-                << "  Gives n=87 -> n_it~1, n=1000 -> n_it~10, n=10000 -> n_it=100\n"
+                << "  Gives n=87 -> n_it~1, n=1000 -> n_it~10, n=10000 -> "
+                   "n_it=100\n"
                 << "\n"
                 << "Output fields (same as benchmark_resolver + GPU extras):\n"
                 << "  backend, n_candidates, n_selected, n_removed\n"
-                << "  time_ms_{mean,std,median,p95}  -- GPU resolver only (no transfer)\n"
+                << "  time_ms_{mean,std,median,p95}  -- GPU resolver only (no "
+                   "transfer)\n"
                 << "  events_per_sec, peak_memory_mb\n"
                 << "  output_hash (== cpu_hash when correct)\n"
-                << "  time_h2d_ms, time_d2h_ms, cpu_hash, gpu_hash, hash_match\n";
+                << "  time_h2d_ms, time_d2h_ms, cpu_hash, gpu_hash, "
+                   "hash_match\n";
             return 0;
         }
     }
@@ -314,20 +320,19 @@ int main(int argc, char* argv[]) {
     // ------------------------------------------------------------------
     vecmem::host_memory_resource host_mr;
     traccc::ambiguity_resolution_config config;
-    traccc::edm::track_container<traccc::default_algebra>::host track_candidates{
-        host_mr};
+    traccc::edm::track_container<traccc::default_algebra>::host
+        track_candidates{host_mr};
     traccc::edm::track_container<traccc::default_algebra>::host* input_tracks =
         &track_candidates;
 
     std::optional<traccc::io::ambiguity_input_data> dump_data;
-    std::optional<
-        traccc::edm::measurement_collection::host>
+    std::optional<traccc::edm::measurement_collection::host>
         synthetic_measurements;
 
     if (!input_dump.empty()) {
         dump_data = traccc::io::read_ambiguity_input(input_dump, host_mr);
         input_tracks = &dump_data->tracks;
-        config       = dump_data->config;
+        config = dump_data->config;
         // The GPU resolver requires measurement IDs to form a dense contiguous
         // range [0, n_meas-1]. Real physics dumps have sparse detector-geometry
         // IDs. Reassign identifiers sequentially; constituent links already
@@ -342,10 +347,10 @@ int main(int argc, char* argv[]) {
         traccc::measurement_id_type max_meas_id = 10000;
         std::array<std::size_t, 2> trk_len_range = {3, 10};
         if (conflict_density == "low") {
-            max_meas_id   = 50000;
+            max_meas_id = 50000;
             trk_len_range = {3, 10};
         } else if (conflict_density == "high") {
-            max_meas_id   = 500;
+            max_meas_id = 500;
             trk_len_range = {5, 15};
         }
 
@@ -380,10 +385,9 @@ int main(int argc, char* argv[]) {
     }
 
     // Pointer to host measurement collection (valid for lifetime of benchmark)
-    traccc::edm::measurement_collection::host*
-        meas_host_ptr = synthetic_measurements
-                            ? &(*synthetic_measurements)
-                            : &dump_data->measurements;
+    traccc::edm::measurement_collection::host* meas_host_ptr =
+        synthetic_measurements ? &(*synthetic_measurements)
+                               : &dump_data->measurements;
 
     const std::size_t n_input = input_tracks->tracks.size();
 
@@ -392,11 +396,13 @@ int main(int argc, char* argv[]) {
     // ------------------------------------------------------------------
     traccc::host::greedy_ambiguity_resolution_algorithm cpu_resolver(config,
                                                                      host_mr);
-    cpu_resolver(traccc::edm::track_container<
-                 traccc::default_algebra>::const_data(*input_tracks));
-    auto cpu_result = cpu_resolver(traccc::edm::track_container<
-                                   traccc::default_algebra>::const_data(*input_tracks));
-    const std::string cpu_hash     = compute_hash_host(cpu_result);
+    cpu_resolver(
+        traccc::edm::track_container<traccc::default_algebra>::const_data(
+            *input_tracks));
+    auto cpu_result = cpu_resolver(
+        traccc::edm::track_container<traccc::default_algebra>::const_data(
+            *input_tracks));
+    const std::string cpu_hash = compute_hash_host(cpu_result);
     const std::size_t n_selected_cpu = cpu_result.tracks.size();
 
     // ------------------------------------------------------------------
@@ -407,9 +413,8 @@ int main(int argc, char* argv[]) {
     traccc::cuda::stream stream;
     vecmem::cuda::async_copy copy{stream.cudaStream()};
 
-    traccc::cuda::greedy_ambiguity_resolution_algorithm gpu_resolver(config, mr,
-                                                                     copy,
-                                                                     stream);
+    traccc::cuda::greedy_ambiguity_resolution_algorithm gpu_resolver(
+        config, mr, copy, stream);
     gpu_resolver.set_n_it_max(n_it_max);
     gpu_resolver.set_adaptive_n_it(adaptive_n_it);
 
@@ -420,14 +425,14 @@ int main(int argc, char* argv[]) {
     // ------------------------------------------------------------------
     // H2D transfer (timed — single pass, before warmup)
     // ------------------------------------------------------------------
-    using clk   = std::chrono::high_resolution_clock;
+    using clk = std::chrono::high_resolution_clock;
     using ms_dur = std::chrono::duration<double, std::milli>;
 
     auto h2d_t0 = clk::now();
 
-    auto meas_device_buf = copy.to(vecmem::get_data(*meas_host_ptr), device_mr,
-                                   &host_mr,
-                                   vecmem::copy::type::host_to_device);
+    auto meas_device_buf =
+        copy.to(vecmem::get_data(*meas_host_ptr), device_mr, &host_mr,
+                vecmem::copy::type::host_to_device);
     auto tracks_device_buf =
         copy.to(vecmem::get_data(input_tracks->tracks), device_mr, &host_mr,
                 vecmem::copy::type::host_to_device);
@@ -457,16 +462,16 @@ int main(int argc, char* argv[]) {
     using graph_algo_t =
         traccc::cuda::greedy_ambiguity_resolution_algorithm::graph_algo_t;
 
-    auto run_one = [&](const std::string& label, bool use_pbg,
-                       graph_algo_t graph_algo,
-                       std::vector<unsigned int>* batch_log,
-                       std::vector<std::pair<unsigned int, unsigned int>>*
-                           graph_size_log) -> run_metrics {
+    auto run_one =
+        [&](const std::string& label, bool use_pbg, graph_algo_t graph_algo,
+            std::vector<unsigned int>* batch_log,
+            std::vector<std::pair<unsigned int, unsigned int>>* graph_size_log)
+        -> run_metrics {
         // PBG and conflict-graph modes are mutually exclusive at the host
         // level: enabling graph mode disables PBG on the resolver so the
         // dispatcher picks the graph path.
-        gpu_resolver.set_parallel_batch_mode(
-            use_pbg && graph_algo == graph_algo_t::NONE);
+        gpu_resolver.set_parallel_batch_mode(use_pbg &&
+                                             graph_algo == graph_algo_t::NONE);
         gpu_resolver.set_parallel_batch_window(parallel_batch_window);
         gpu_resolver.set_batch_size_log(
             graph_algo == graph_algo_t::NONE ? batch_log : nullptr);
@@ -495,11 +500,10 @@ int main(int argc, char* argv[]) {
 
         auto d2h_t0 = clk::now();
         traccc::edm::track_container<traccc::default_algebra>::buffer
-            result_host_buf{
-                copy.to(check_result_buf.tracks, host_mr, nullptr,
-                        vecmem::copy::type::device_to_host),
-                {},
-                vecmem::get_data(*meas_host_ptr)};
+            result_host_buf{copy.to(check_result_buf.tracks, host_mr, nullptr,
+                                    vecmem::copy::type::device_to_host),
+                            {},
+                            vecmem::get_data(*meas_host_ptr)};
         stream.synchronize();
         double d2h_ms_local = ms_dur(clk::now() - d2h_t0).count();
 
@@ -513,27 +517,28 @@ int main(int argc, char* argv[]) {
                 .tracks.size();
         m.d2h_ms = d2h_ms_local;
 
-        m.mean_ms =
-            std::accumulate(times_ms.begin(), times_ms.end(), 0.0) /
-            static_cast<double>(repeats);
+        m.mean_ms = std::accumulate(times_ms.begin(), times_ms.end(), 0.0) /
+                    static_cast<double>(repeats);
         double sum_sq = 0;
-        for (double t : times_ms) sum_sq += (t - m.mean_ms) * (t - m.mean_ms);
+        for (double t : times_ms)
+            sum_sq += (t - m.mean_ms) * (t - m.mean_ms);
         m.std_ms = std::sqrt(sum_sq / static_cast<double>(repeats));
 
         std::vector<double> sorted_times = times_ms;
-        std::nth_element(sorted_times.begin(),
-                         sorted_times.begin() +
-                             static_cast<std::ptrdiff_t>(repeats / 2),
-                         sorted_times.end());
+        std::nth_element(
+            sorted_times.begin(),
+            sorted_times.begin() + static_cast<std::ptrdiff_t>(repeats / 2),
+            sorted_times.end());
         m.median_ms = sorted_times[repeats / 2];
 
         std::size_t p95_idx =
             static_cast<std::size_t>(static_cast<double>(repeats) * 0.95);
-        if (p95_idx >= repeats) p95_idx = repeats - 1;
-        std::nth_element(sorted_times.begin(),
-                         sorted_times.begin() +
-                             static_cast<std::ptrdiff_t>(p95_idx),
-                         sorted_times.end());
+        if (p95_idx >= repeats)
+            p95_idx = repeats - 1;
+        std::nth_element(
+            sorted_times.begin(),
+            sorted_times.begin() + static_cast<std::ptrdiff_t>(p95_idx),
+            sorted_times.end());
         m.p95_ms = sorted_times[p95_idx];
 
         m.hash_match = (m.gpu_hash == cpu_hash);
@@ -584,32 +589,31 @@ int main(int argc, char* argv[]) {
 
     double peak_mb = get_peak_rss_mb();
 
-    auto dump_backend_metrics =
-        [&](const run_metrics& m, const std::string& prefix) {
-            std::cout << prefix << "label=" << m.label << "\n"
-                      << prefix << "n_selected=" << m.n_selected
-                      << " n_removed=" << (n_input - m.n_selected) << "\n"
-                      << prefix << "time_ms_mean=" << m.mean_ms
-                      << " time_ms_std=" << m.std_ms
-                      << " time_ms_median=" << m.median_ms
-                      << " time_ms_p95=" << m.p95_ms << "\n"
-                      << prefix << "events_per_sec=" << (1000.0 / m.mean_ms)
-                      << "\n"
-                      << prefix << "time_d2h_ms=" << m.d2h_ms << "\n"
-                      << prefix << "output_hash=" << m.gpu_hash << "\n"
-                      << prefix << "hash_match="
-                      << (m.hash_match ? "true" : "false") << "\n"
-                      << prefix << "track_overlap_vs_cpu="
-                      << m.track_overlap_vs_cpu << "\n"
-                      << prefix << "duplicate_rate_post="
-                      << m.duplicate_rate_post << "\n";
-        };
+    auto dump_backend_metrics = [&](const run_metrics& m,
+                                    const std::string& prefix) {
+        std::cout << prefix << "label=" << m.label << "\n"
+                  << prefix << "n_selected=" << m.n_selected
+                  << " n_removed=" << (n_input - m.n_selected) << "\n"
+                  << prefix << "time_ms_mean=" << m.mean_ms
+                  << " time_ms_std=" << m.std_ms
+                  << " time_ms_median=" << m.median_ms
+                  << " time_ms_p95=" << m.p95_ms << "\n"
+                  << prefix << "events_per_sec=" << (1000.0 / m.mean_ms) << "\n"
+                  << prefix << "time_d2h_ms=" << m.d2h_ms << "\n"
+                  << prefix << "output_hash=" << m.gpu_hash << "\n"
+                  << prefix
+                  << "hash_match=" << (m.hash_match ? "true" : "false") << "\n"
+                  << prefix << "track_overlap_vs_cpu=" << m.track_overlap_vs_cpu
+                  << "\n"
+                  << prefix << "duplicate_rate_post=" << m.duplicate_rate_post
+                  << "\n";
+    };
 
     std::cout << "backend=gpu\n"
               << "n_it_max=" << n_it_max << "\n"
               << "adaptive_n_it=" << (adaptive_n_it ? "true" : "false") << "\n"
-              << "parallel_batch_enabled=" << (parallel_batch ? "true" : "false")
-              << "\n"
+              << "parallel_batch_enabled="
+              << (parallel_batch ? "true" : "false") << "\n"
               << "parallel_batch_window=" << parallel_batch_window << "\n"
               << "n_candidates=" << n_input
               << " n_selected_cpu=" << n_selected_cpu << "\n"
@@ -629,13 +633,13 @@ int main(int argc, char* argv[]) {
             unsigned int max_b = 0;
             for (auto b : pbg->batch_sizes) {
                 sum_b += b;
-                if (b > max_b) max_b = b;
+                if (b > max_b)
+                    max_b = b;
             }
-            std::cout
-                << "pbg_avg_batch_size="
-                << (sum_b / static_cast<double>(pbg->batch_sizes.size()))
-                << "\n"
-                << "pbg_max_batch_size=" << max_b << "\n";
+            std::cout << "pbg_avg_batch_size="
+                      << (sum_b / static_cast<double>(pbg->batch_sizes.size()))
+                      << "\n"
+                      << "pbg_max_batch_size=" << max_b << "\n";
         }
         if (!log_batch_sizes_path.empty()) {
             std::ofstream f(log_batch_sizes_path);
@@ -643,22 +647,23 @@ int main(int argc, char* argv[]) {
             for (std::size_t i = 0; i < pbg->batch_sizes.size(); ++i) {
                 f << i << "," << pbg->batch_sizes[i] << "\n";
             }
-            std::cout << "pbg_batch_size_log_written="
-                      << log_batch_sizes_path << "\n";
+            std::cout << "pbg_batch_size_log_written=" << log_batch_sizes_path
+                      << "\n";
         }
     }
 
     auto dump_graph_metrics = [&](const run_metrics& m,
                                   const std::string& prefix) {
         dump_backend_metrics(m, prefix);
-        std::cout << prefix << "n_outer_iterations="
-                  << m.batch_sizes.size() << "\n";
+        std::cout << prefix << "n_outer_iterations=" << m.batch_sizes.size()
+                  << "\n";
         if (!m.batch_sizes.empty()) {
             double sum_b = 0.0;
             unsigned int max_b = 0;
             for (auto b : m.batch_sizes) {
                 sum_b += b;
-                if (b > max_b) max_b = b;
+                if (b > max_b)
+                    max_b = b;
             }
             std::cout << prefix << "avg_batch_size="
                       << (sum_b / static_cast<double>(m.batch_sizes.size()))
@@ -671,11 +676,12 @@ int main(int argc, char* argv[]) {
             for (auto& ve : m.graph_sizes) {
                 sum_v += ve.first;
                 sum_e += ve.second;
-                if (ve.first > max_v) max_v = ve.first;
-                if (ve.second > max_e) max_e = ve.second;
+                if (ve.first > max_v)
+                    max_v = ve.first;
+                if (ve.second > max_e)
+                    max_e = ve.second;
             }
-            const double n_iter =
-                static_cast<double>(m.graph_sizes.size());
+            const double n_iter = static_cast<double>(m.graph_sizes.size());
             std::cout << prefix << "avg_vertices=" << (sum_v / n_iter) << "\n"
                       << prefix << "avg_edges=" << (sum_e / n_iter) << "\n"
                       << prefix << "max_vertices=" << max_v << "\n"
@@ -688,7 +694,8 @@ int main(int argc, char* argv[]) {
         if (!log_graph_batches_path.empty()) {
             std::ofstream f(log_graph_batches_path + ".mis.csv");
             f << "outer_iter,batch_size\n";
-            for (std::size_t i = 0; i < graph_mis_run->batch_sizes.size(); ++i) {
+            for (std::size_t i = 0; i < graph_mis_run->batch_sizes.size();
+                 ++i) {
                 f << i << "," << graph_mis_run->batch_sizes[i] << "\n";
             }
         }
@@ -714,8 +721,7 @@ int main(int argc, char* argv[]) {
         if (!log_graph_sizes_path.empty()) {
             std::ofstream f(log_graph_sizes_path + ".jp.csv");
             f << "outer_iter,n_vertices,n_edges\n";
-            for (std::size_t i = 0; i < graph_jp_run->graph_sizes.size();
-                 ++i) {
+            for (std::size_t i = 0; i < graph_jp_run->graph_sizes.size(); ++i) {
                 f << i << "," << graph_jp_run->graph_sizes[i].first << ","
                   << graph_jp_run->graph_sizes[i].second << "\n";
             }
@@ -734,11 +740,12 @@ int main(int argc, char* argv[]) {
               << "output_hash=" << baseline.gpu_hash << "\n"
               << "time_d2h_ms=" << baseline.d2h_ms << "\n"
               << "gpu_hash=" << baseline.gpu_hash << "\n"
-              << "hash_match="
-              << (baseline.hash_match ? "true" : "false") << "\n";
+              << "hash_match=" << (baseline.hash_match ? "true" : "false")
+              << "\n";
 
     if (!baseline.hash_match)
-        std::cerr << "WARNING: GPU baseline hash does not match CPU reference\n";
+        std::cerr
+            << "WARNING: GPU baseline hash does not match CPU reference\n";
     if (baseline.n_selected != n_selected_cpu)
         std::cerr << "WARNING: GPU baseline selected " << baseline.n_selected
                   << " tracks but CPU selected " << n_selected_cpu << "\n";
@@ -755,17 +762,22 @@ int main(int argc, char* argv[]) {
         stream.synchronize();
         gpu_resolver.set_profiling(false);
 
-        const traccc::cuda::gpu_profile_data_t& pd = gpu_resolver.last_profile();
-        std::cout << "profile_filter_setup_ms="          << pd.filter_setup_ms          << "\n"
-                  << "profile_unique_meas_ms="           << pd.unique_meas_ms           << "\n"
-                  << "profile_inverted_index_ms="        << pd.inverted_index_ms        << "\n"
-                  << "profile_shared_count_ms="          << pd.shared_count_ms          << "\n"
-                  << "profile_initial_sort_ms="          << pd.initial_sort_ms          << "\n"
-                  << "profile_eviction_loop_ms="         << pd.eviction_loop_ms         << "\n"
-                  << "profile_output_copy_ms="           << pd.output_copy_ms           << "\n"
-                  << "profile_eviction_graph_launches="  << pd.eviction_graph_launches  << "\n"
-                  << "profile_unique_meas_count="        << pd.unique_meas_count        << "\n"
-                  << "profile_hash_match="               << (hash_match ? "true" : "false") << "\n";
+        const traccc::cuda::gpu_profile_data_t& pd =
+            gpu_resolver.last_profile();
+        std::cout << "profile_filter_setup_ms=" << pd.filter_setup_ms << "\n"
+                  << "profile_unique_meas_ms=" << pd.unique_meas_ms << "\n"
+                  << "profile_inverted_index_ms=" << pd.inverted_index_ms
+                  << "\n"
+                  << "profile_shared_count_ms=" << pd.shared_count_ms << "\n"
+                  << "profile_initial_sort_ms=" << pd.initial_sort_ms << "\n"
+                  << "profile_eviction_loop_ms=" << pd.eviction_loop_ms << "\n"
+                  << "profile_output_copy_ms=" << pd.output_copy_ms << "\n"
+                  << "profile_eviction_graph_launches="
+                  << pd.eviction_graph_launches << "\n"
+                  << "profile_unique_meas_count=" << pd.unique_meas_count
+                  << "\n"
+                  << "profile_hash_match=" << (hash_match ? "true" : "false")
+                  << "\n";
     }
 
     return 0;

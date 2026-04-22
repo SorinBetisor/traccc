@@ -5,12 +5,11 @@
  * Mozilla Public License Version 2.0
  */
 
-#include "traccc/definitions/primitives.hpp"
-
-#include "batch_confirm.cuh"
-
 #include <vecmem/containers/device_vector.hpp>
 #include <vecmem/containers/jagged_device_vector.hpp>
+
+#include "batch_confirm.cuh"
+#include "traccc/definitions/primitives.hpp"
 
 namespace traccc::cuda::kernels {
 

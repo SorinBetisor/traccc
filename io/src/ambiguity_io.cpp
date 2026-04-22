@@ -6,18 +6,17 @@
  */
 
 #include "traccc/io/ambiguity_io.hpp"
-#include "traccc/io/utils.hpp"
-
-#include <vecmem/utils/copy.hpp>
-
-#include <nlohmann/json.hpp>
 
 #include <fstream>
+#include <nlohmann/json.hpp>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vecmem/utils/copy.hpp>
 #include <vector>
+
+#include "traccc/io/utils.hpp"
 
 namespace traccc::io {
 
@@ -37,9 +36,11 @@ void write_ambiguity_input_impl(
     j["config"]["max_shared_meas"] = config.max_shared_meas;
 
     std::set<measurement_id_type> unique_ids;
-    using size_type = edm::track_collection<default_algebra>::const_device::size_type;
+    using size_type =
+        edm::track_collection<default_algebra>::const_device::size_type;
     for (size_type i = 0; i < tracks.tracks.size(); ++i) {
-        for (const auto& [type, idx] : tracks.tracks.at(i).constituent_links()) {
+        const auto& tc = tracks.tracks.at(i);
+        for (const auto& [type, idx] : tc.constituent_links()) {
             if (type == edm::track_constituent_link::measurement) {
                 unique_ids.insert(tracks.measurements.at(idx).identifier());
             }
@@ -107,8 +108,7 @@ ambiguity_input_data read_ambiguity_input(std::string_view path,
         j["config"].value("min_meas_per_track", 3u);
     result.config.max_iterations =
         j["config"].value("max_iterations", 0xFFFFFFFFu);
-    result.config.max_shared_meas =
-        j["config"].value("max_shared_meas", 1u);
+    result.config.max_shared_meas = j["config"].value("max_shared_meas", 1u);
 
     result.measurements.reserve(j["measurements"].size());
     for (const auto& m : j["measurements"]) {

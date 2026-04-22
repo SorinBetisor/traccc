@@ -67,8 +67,7 @@ __global__ void graph_mis_propose(device::graph_mis_round_payload payload) {
         }
         has_undecided_neighbor = true;
         const unsigned int their_prio = priority[u];
-        if (their_prio > my_prio ||
-            (their_prio == my_prio && u > v)) {
+        if (their_prio > my_prio || (their_prio == my_prio && u > v)) {
             i_am_local_max = false;
             break;
         }
