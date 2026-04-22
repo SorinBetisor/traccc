@@ -21,6 +21,7 @@
 #include <vecmem/utils/copy.hpp>
 
 // System include(s).
+#include <utility>
 #include <vector>
 
 namespace traccc::cuda {
@@ -115,6 +116,37 @@ class greedy_ambiguity_resolution_algorithm
         m_batch_size_log = out;
     }
 
+    /// Tier 2c: algorithm selector for the explicit-conflict-graph path.
+    ///   NONE      — disable explicit conflict graph (fall through to the
+    ///               PBG or baseline path, depending on set_parallel_batch_mode).
+    ///   LUBY_MIS  — build the explicit CSR conflict graph once per outer
+    ///               iteration and run Luby-style maximal independent set
+    ///               with deterministic priority (lowest sorted-rank wins).
+    ///               The MIS *is* the set of tracks removed in that iteration.
+    ///   JP_COLOR  — build the CSR graph once per outer iteration, run
+    ///               Jones–Plassmann coloring with deterministic priority,
+    ///               and remove color class 0 (vertices whose priority is
+    ///               locally maximal) per iteration.
+    /// See docs/analysis/novelty_algs/conflict_graph_design.md.
+    enum class graph_algo_t { NONE, LUBY_MIS, JP_COLOR };
+    void set_conflict_graph_mode(graph_algo_t a) { m_graph_algo = a; }
+    graph_algo_t conflict_graph_mode() const { return m_graph_algo; }
+
+    /// Per-outer-iteration number of tracks removed (MIS size or color-class
+    /// size). Hooked when conflict_graph_mode is not NONE. Caller owns
+    /// storage; pass nullptr to disable. Default: nullptr.
+    void set_graph_batch_log(std::vector<unsigned int>* out) {
+        m_graph_batch_log = out;
+    }
+
+    /// Per-outer-iteration number of vertices / edges in the conflict graph
+    /// that was built. Hooked when conflict_graph_mode is not NONE. Caller
+    /// owns storage; pass nullptr to disable. Default: nullptr.
+    void set_graph_size_log(std::vector<std::pair<unsigned int,
+                                                   unsigned int>>* out) {
+        m_graph_size_log = out;
+    }
+
     private:
     /// Algorithm configuration
     config_type m_config;
@@ -133,6 +165,10 @@ class greedy_ambiguity_resolution_algorithm
     bool                       m_parallel_batch{false};
     unsigned int               m_parallel_batch_window{8192u};
     mutable std::vector<unsigned int>* m_batch_size_log{nullptr};
+    graph_algo_t               m_graph_algo{graph_algo_t::NONE};
+    mutable std::vector<unsigned int>* m_graph_batch_log{nullptr};
+    mutable std::vector<std::pair<unsigned int, unsigned int>>*
+        m_graph_size_log{nullptr};
 };
 
 }  // namespace traccc::cuda

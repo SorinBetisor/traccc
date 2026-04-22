@@ -10,17 +10,23 @@
 #include "../utils/utils.hpp"
 #include "./kernels/add_block_offset.cuh"
 #include "./kernels/apply_batch_removals.cuh"
+#include "./kernels/apply_graph_removals.cuh"
 #include "./kernels/batch_commit.cuh"
 #include "./kernels/batch_confirm.cuh"
 #include "./kernels/batch_identify_removals.cuh"
 #include "./kernels/batch_prologue.cuh"
 #include "./kernels/block_inclusive_scan.cuh"
+#include "./kernels/build_conflict_coo.cuh"
+#include "./kernels/compact_sorted_ids.cuh"
 #include "./kernels/count_shared_measurements.cuh"
 #include "./kernels/fill_inverted_ids.cuh"
+#include "./kernels/fill_keep_flags.cuh"
 #include "./kernels/fill_track_candidates.cuh"
 #include "./kernels/fill_tracks_per_measurement.cuh"
 #include "./kernels/fill_unique_meas_id_map.cuh"
 #include "./kernels/fill_vectors.cuh"
+#include "./kernels/graph_mis_init.cuh"
+#include "./kernels/graph_mis_round.cuh"
 #include "./kernels/rearrange_tracks.cuh"
 #include "./kernels/remove_tracks.cuh"
 #include "./kernels/scan_block_offsets.cuh"
@@ -42,12 +48,16 @@
 #endif
 
 // Thrust include(s).
+#include <thrust/binary_search.h>
 #include <thrust/execution_policy.h>
 #include <thrust/extrema.h>
 #include <thrust/fill.h>
 #include <thrust/functional.h>
 #include <thrust/iterator/constant_iterator.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/scatter.h>
 #include <thrust/reduce.h>
+#include <thrust/scan.h>
 #include <thrust/sort.h>
 #include <thrust/transform.h>
 #include <thrust/unique.h>
@@ -586,6 +596,68 @@ greedy_ambiguity_resolution_algorithm::operator()(
     std::vector<unsigned int> batch_sizes_this_call;
     batch_sizes_this_call.reserve(256);
 
+    // --- Tier 2c (explicit conflict graph) buffers and logs. Allocated only
+    // when a graph algorithm is selected; otherwise the pointers stay unused.
+    // Memory cost is O(n_tracks + max_edges) on top of the baseline.
+    vecmem::data::vector_buffer<int> is_removed_buffer{n_tracks, m_mr.main};
+    vecmem::data::vector_buffer<int> keep_flag_per_slot_buffer{n_tracks,
+                                                               m_mr.main};
+    vecmem::data::vector_buffer<int> keep_prefix_sums_buffer{n_tracks,
+                                                             m_mr.main};
+    vecmem::data::vector_buffer<unsigned int> mis_priority_buffer{n_tracks,
+                                                                  m_mr.main};
+    vecmem::data::vector_buffer<int> mis_active_buffer{n_tracks, m_mr.main};
+    vecmem::data::vector_buffer<int> mis_state_buffer{n_tracks, m_mr.main};
+    m_copy.get().setup(is_removed_buffer)->ignore();
+    m_copy.get().setup(keep_flag_per_slot_buffer)->ignore();
+    m_copy.get().setup(keep_prefix_sums_buffer)->ignore();
+    m_copy.get().setup(mis_priority_buffer)->ignore();
+    m_copy.get().setup(mis_active_buffer)->ignore();
+    m_copy.get().setup(mis_state_buffer)->ignore();
+    m_copy.get().memset(is_removed_buffer, 0)->ignore();
+
+    // Upper bound on directed edges: two per accepted-track pair per unique
+    // measurement. Tracks sharing multiple measurements contribute duplicate
+    // edges; the MIS / coloring kernels tolerate them (each duplicate just
+    // means one more neighbour-loop iteration). The bound is a one-time
+    // overestimate; no incremental growth during the outer loop.
+    std::size_t max_edges_ub = 0u;
+    if (m_graph_algo != graph_algo_t::NONE) {
+        for (auto n_m : unique_meas_counts) {
+            if (n_m > 1) {
+                max_edges_ub += static_cast<std::size_t>(n_m) *
+                                static_cast<std::size_t>(n_m - 1);
+            }
+        }
+        if (max_edges_ub == 0u) {
+            max_edges_ub = 1u;  // avoid zero-size allocation
+        }
+    } else {
+        max_edges_ub = 1u;
+    }
+
+    vecmem::data::vector_buffer<unsigned int> coo_src_buffer{
+        static_cast<unsigned int>(max_edges_ub), m_mr.main};
+    vecmem::data::vector_buffer<unsigned int> coo_dst_buffer{
+        static_cast<unsigned int>(max_edges_ub), m_mr.main};
+    vecmem::data::vector_buffer<unsigned int> row_ptr_buffer{n_tracks + 1u,
+                                                             m_mr.main};
+    m_copy.get().setup(coo_src_buffer)->ignore();
+    m_copy.get().setup(coo_dst_buffer)->ignore();
+    m_copy.get().setup(row_ptr_buffer)->ignore();
+
+    vecmem::unique_alloc_ptr<unsigned int> edge_count_device =
+        vecmem::make_unique_alloc<unsigned int>(m_mr.main);
+    vecmem::unique_alloc_ptr<int> any_undecided_device =
+        vecmem::make_unique_alloc<int>(m_mr.main);
+
+    std::vector<unsigned int> graph_batches_this_call;
+    std::vector<std::pair<unsigned int, unsigned int>> graph_sizes_this_call;
+    if (m_graph_algo != graph_algo_t::NONE) {
+        graph_batches_this_call.reserve(256);
+        graph_sizes_this_call.reserve(256);
+    }
+
     AR_NVTX_PUSH("gpu_ar_eviction_loop");
     // Start the iteration
     while (!terminate && n_accepted > 0) {
@@ -599,6 +671,302 @@ greedy_ambiguity_resolution_algorithm::operator()(
             (n_accepted + (nThreads_rearrange / kernels::nThreads_per_track) -
              1) /
             (nThreads_rearrange / kernels::nThreads_per_track);
+
+        if (m_graph_algo != graph_algo_t::NONE) {
+            // ----------------------------------------------------------------
+            // Tier 2c: explicit conflict-graph removal path.
+            //
+            // Per-iteration structure:
+            //   1. Zero per-iteration scratch counters.
+            //   2. Build the undirected conflict graph over the currently
+            //      accepted & still-shared tracks (COO, then sort to CSR).
+            //   3. Initialise MIS/JP state from inverted_ids (priority) and
+            //      n_shared (active mask).
+            //   4. Either (LUBY_MIS) run Luby rounds until no UNDECIDED
+            //      vertices remain, or (JP_COLOR) run a single round so the
+            //      selected set is the round-1 local-max IS.
+            //   5. apply_graph_removals propagates measurement bookkeeping
+            //      and raises is_removed[t] for each IN_MIS track.
+            //   6. Stage 1 compaction rewrites sorted_ids with the removed
+            //      tracks dropped, then the standard rearrange / update_status
+            //      path repositions survivors whose rel_shared has changed.
+            //
+            // Kernel launches are direct (no cudaGraph capture) because the
+            // thrust calls for sort_by_key and upper_bound are stream-based
+            // and the per-iteration structure changes between outer steps.
+            // See docs/analysis/novelty_algs/conflict_graph_design.md.
+            const unsigned int nt_vtx = m_warp_size * 2;
+            const unsigned int nb_vtx = (n_tracks + nt_vtx - 1) / nt_vtx;
+
+            // Clear per-iteration scratch. These fan-in through direct launches
+            // rather than a captured graph, so the zero is just a memset.
+            cudaMemsetAsync(batch_size_device.get(), 0, sizeof(unsigned int),
+                            stream);
+            cudaMemsetAsync(n_updated_tracks_device.get(), 0,
+                            sizeof(unsigned int), stream);
+            cudaMemsetAsync(edge_count_device.get(), 0, sizeof(unsigned int),
+                            stream);
+
+            // Refresh inverted_ids so it reflects the current sorted_ids
+            // layout. The baseline fill_inverted_ids kernel early-returns
+            // when n_updated_tracks == 0 (because in the baseline/PBG
+            // pipeline it is only used to patch positions for in-place
+            // rearrangement); in graph mode we need a full rebuild every
+            // outer iteration, so we scatter via thrust directly.
+            {
+                auto ci_begin =
+                    thrust::counting_iterator<unsigned int>(0u);
+                thrust::scatter(thrust_policy, ci_begin,
+                                ci_begin + n_accepted,
+                                sorted_ids_buffer.ptr(),
+                                inverted_ids_buffer.ptr());
+            }
+
+            // Build COO edge list. One block per unique measurement.
+            {
+                const unsigned int nt_coo = 128u;
+                const std::size_t smem_bytes =
+                    static_cast<std::size_t>(nt_coo) * sizeof(unsigned int);
+                kernels::build_conflict_coo<<<meas_count, nt_coo, smem_bytes,
+                                              stream>>>(
+                    device::build_conflict_coo_payload{
+                        .tracks_per_measurement_view =
+                            tracks_per_measurement_buffer,
+                        .track_status_per_measurement_view =
+                            track_status_per_measurement_buffer,
+                        .n_accepted_tracks_per_measurement_view =
+                            n_accepted_tracks_per_measurement_buffer,
+                        .coo_src_view = coo_src_buffer,
+                        .coo_dst_view = coo_dst_buffer,
+                        .edge_count = edge_count_device.get(),
+                        .meas_count = meas_count});
+            }
+
+            // Read edge count to host. Only rank-0 thrust calls need it, but
+            // getting it once lets us bound the sort size.
+            unsigned int n_edges_host = 0u;
+            cudaMemcpyAsync(&n_edges_host, edge_count_device.get(),
+                            sizeof(unsigned int), cudaMemcpyDeviceToHost,
+                            stream);
+            m_stream.get().synchronize();
+
+            if (n_edges_host > 0u) {
+                // Sort COO pairs by src. Co-sort dst so that col_idx lines up.
+                thrust::sort_by_key(thrust_policy, coo_src_buffer.ptr(),
+                                    coo_src_buffer.ptr() + n_edges_host,
+                                    coo_dst_buffer.ptr());
+
+                // Build row_ptr[0..n_tracks]. row_ptr[v] = number of edges
+                // with src < v (== lower_bound position of v in sorted src).
+                auto ci_begin = thrust::counting_iterator<unsigned int>(0u);
+                thrust::lower_bound(
+                    thrust_policy, coo_src_buffer.ptr(),
+                    coo_src_buffer.ptr() + n_edges_host, ci_begin,
+                    ci_begin + (n_tracks + 1u), row_ptr_buffer.ptr());
+            } else {
+                // No edges: row_ptr is all zeros. Still safe to launch MIS.
+                cudaMemsetAsync(row_ptr_buffer.ptr(), 0,
+                                sizeof(unsigned int) * (n_tracks + 1u),
+                                stream);
+            }
+
+            // Initialise MIS state from the current iteration.
+            kernels::graph_mis_init<<<nb_vtx, nt_vtx, 0, stream>>>(
+                device::graph_mis_init_payload{
+                    .inverted_ids_view = inverted_ids_buffer,
+                    .n_shared_view = n_shared_buffer,
+                    .n_accepted = n_accepted_device.get(),
+                    .priority_view = mis_priority_buffer,
+                    .mis_active_view = mis_active_buffer,
+                    .mis_state_view = mis_state_buffer,
+                    .n_vertices = n_tracks});
+
+            // MIS / JP rounds.
+            {
+                device::graph_mis_round_payload round_payload{
+                    .mis_active_view = mis_active_buffer,
+                    .mis_state_view = mis_state_buffer,
+                    .priority_view = mis_priority_buffer,
+                    .row_ptr_view = row_ptr_buffer,
+                    .col_idx_view = coo_dst_buffer,
+                    .n_vertices = n_tracks,
+                    .any_undecided = any_undecided_device.get()};
+
+                const unsigned int max_rounds =
+                    (m_graph_algo == graph_algo_t::JP_COLOR) ? 1u : 32u;
+                for (unsigned int r = 0u; r < max_rounds; ++r) {
+                    cudaMemsetAsync(any_undecided_device.get(), 0, sizeof(int),
+                                    stream);
+                    kernels::graph_mis_propose<<<nb_vtx, nt_vtx, 0, stream>>>(
+                        round_payload);
+                    kernels::graph_mis_finalize<<<nb_vtx, nt_vtx, 0, stream>>>(
+                        round_payload);
+
+                    // Host-side convergence check. Synchronise so that the
+                    // flag reflects this round's result.
+                    int undecided_host = 0;
+                    cudaMemcpyAsync(&undecided_host,
+                                    any_undecided_device.get(), sizeof(int),
+                                    cudaMemcpyDeviceToHost, stream);
+                    m_stream.get().synchronize();
+                    if (undecided_host == 0) {
+                        break;
+                    }
+                }
+            }
+
+            // Apply removals: flip per-measurement bookkeeping, raise
+            // is_removed / is_updated.
+            kernels::apply_graph_removals<<<nb_vtx, nt_vtx, 0, stream>>>(
+                device::apply_graph_removals_payload{
+                    .meas_ids_view = meas_ids_buffer,
+                    .n_meas_view = n_meas_buffer,
+                    .meas_id_to_unique_id_view = meas_id_to_unique_id_buffer,
+                    .tracks_per_measurement_view =
+                        tracks_per_measurement_buffer,
+                    .track_status_per_measurement_view =
+                        track_status_per_measurement_buffer,
+                    .n_accepted_tracks_per_measurement_view =
+                        n_accepted_tracks_per_measurement_buffer,
+                    .n_shared_view = n_shared_buffer,
+                    .mis_state_view = mis_state_buffer,
+                    .is_removed_view = is_removed_buffer,
+                    .is_updated_view = is_updated_buffer,
+                    .updated_tracks_view = updated_tracks_buffer,
+                    .batch_size = batch_size_device.get(),
+                    .n_updated_tracks = n_updated_tracks_device.get(),
+                    .n_vertices = n_tracks});
+
+            // Recompute rel_shared for survivors whose n_shared changed.
+            kernels::update_rel_shared<<<
+                (n_tracks + (m_warp_size * 2) - 1) / (m_warp_size * 2),
+                m_warp_size * 2, 0, stream>>>(
+                device::update_rel_shared_payload{
+                    .terminate = terminate_device.get(),
+                    .n_updated_tracks = n_updated_tracks_device.get(),
+                    .updated_tracks_view = updated_tracks_buffer,
+                    .n_shared_view = n_shared_buffer,
+                    .n_meas_view = n_meas_buffer,
+                    .rel_shared_view = rel_shared_buffer});
+
+            // --- Stage 1 compaction: rewrite sorted_ids dropping removed
+            //     tracks. keep_flag_per_slot[i] = !is_removed[sorted_ids[i]];
+            //     the inclusive prefix sum gives each survivor its new slot,
+            //     and compact_sorted_ids scatters into temp_sorted_ids.
+            kernels::fill_keep_flags<<<nBlocks_adaptive, nThreads_adaptive, 0,
+                                       stream>>>(
+                device::fill_keep_flags_payload{
+                    .sorted_ids_view = sorted_ids_buffer,
+                    .n_accepted = n_accepted_device.get(),
+                    .terminate = terminate_device.get(),
+                    .is_removed_view = is_removed_buffer,
+                    .keep_flag_per_slot_view = keep_flag_per_slot_buffer});
+
+            thrust::inclusive_scan(thrust_policy,
+                                   keep_flag_per_slot_buffer.ptr(),
+                                   keep_flag_per_slot_buffer.ptr() + n_accepted,
+                                   keep_prefix_sums_buffer.ptr());
+
+            kernels::compact_sorted_ids<<<nBlocks_adaptive, nThreads_adaptive,
+                                          0, stream>>>(
+                device::compact_sorted_ids_payload{
+                    .sorted_ids_view = sorted_ids_buffer,
+                    .keep_flag_per_slot_view = keep_flag_per_slot_buffer,
+                    .keep_prefix_sums_view = keep_prefix_sums_buffer,
+                    .compacted_sorted_ids_view = temp_sorted_ids_buffer,
+                    .n_accepted = n_accepted_device.get(),
+                    .terminate = terminate_device.get()});
+
+            // Copy compacted sorted_ids back. We copy at most the old count —
+            // the tail positions past the new n_accepted are left untouched
+            // but never read, since all downstream kernels gate on n_accepted.
+            cudaMemcpyAsync(sorted_ids_buffer.ptr(),
+                            temp_sorted_ids_buffer.ptr(),
+                            sizeof(unsigned int) * n_accepted,
+                            cudaMemcpyDeviceToDevice, stream);
+
+            // Refresh n_accepted on host early — later launches depend on it
+            // via the device-side value, so we only need it for the outer
+            // loop condition and the nBlocks computation next iteration.
+            m_stream.get().synchronize();
+            cudaMemcpyAsync(&n_accepted, n_accepted_device.get(),
+                            sizeof(unsigned int), cudaMemcpyDeviceToHost,
+                            stream);
+            m_stream.get().synchronize();
+
+            // After a graph-algorithm batch the number of simultaneously
+            // updated survivors can vastly exceed the assumptions baked into
+            // the baseline insertion-sort pipeline (which caps the bitonic
+            // sort_updated_tracks at 512 entries and relies on a
+            // contiguous-tail removal shape). Instead of shoehorning those
+            // kernels into graph mode, we globally re-sort sorted_ids with
+            // the same comparator used at init. This costs O(n log n) per
+            // outer iteration but is always correct.
+            if (n_accepted > 0u) {
+                thrust::sort(thrust_policy, sorted_ids_buffer.ptr(),
+                             sorted_ids_buffer.ptr() + n_accepted, trk_comp);
+
+                // Clear is_updated flags for all tracks that got flagged
+                // during apply_graph_removals, so the next outer iteration
+                // sees a fresh slate. We reuse updated_tracks_buffer (which
+                // still contains the list of survivors whose n_shared moved
+                // during apply_graph_removals) as the reset target.
+                {
+                    const unsigned int nt = nThreads_adaptive;
+                    const unsigned int nb_upd =
+                        (n_tracks + nt - 1) / nt;
+                    (void)nb_upd;
+                }
+                cudaMemsetAsync(is_updated_buffer.ptr(), 0,
+                                sizeof(int) * n_tracks, stream);
+
+                // Reset max_shared and recompute it from n_shared over the
+                // surviving tracks. Baseline remove_tracks does this inside
+                // a kernel; with thrust::sort we use thrust::max_element on
+                // the n_shared values of still-accepted tracks. This is
+                // slightly wasteful (iterates all n_tracks) but trivially
+                // correct; the runtime is dominated by the sort above.
+                cudaMemsetAsync(max_shared_device.get(), 0,
+                                sizeof(unsigned int), stream);
+
+                auto max_it = thrust::max_element(thrust_policy,
+                                                  n_shared_buffer.ptr(),
+                                                  n_shared_buffer.ptr() +
+                                                      n_tracks);
+                cudaMemcpyAsync(max_shared_device.get(), max_it,
+                                sizeof(unsigned int),
+                                cudaMemcpyDeviceToDevice, stream);
+            }
+
+            // Pull back iteration summary. Terminate when no track was
+            // removed this iteration (MIS was empty / graph had no edges).
+            unsigned int batch_host = 0u;
+            cudaMemcpyAsync(&batch_host, batch_size_device.get(),
+                            sizeof(unsigned int), cudaMemcpyDeviceToHost,
+                            stream);
+            unsigned int max_shared_host = 0u;
+            cudaMemcpyAsync(&max_shared_host, max_shared_device.get(),
+                            sizeof(unsigned int), cudaMemcpyDeviceToHost,
+                            stream);
+            m_stream.get().synchronize();
+
+            if (m_graph_batch_log != nullptr) {
+                graph_batches_this_call.push_back(batch_host);
+            }
+            if (m_graph_size_log != nullptr) {
+                graph_sizes_this_call.emplace_back(n_accepted, n_edges_host);
+            }
+
+            if (batch_host == 0u || max_shared_host == 0u) {
+                terminate = 1;
+                int one = 1;
+                cudaMemcpyAsync(terminate_device.get(), &one, sizeof(int),
+                                cudaMemcpyHostToDevice, stream);
+                m_stream.get().synchronize();
+            }
+
+            continue;
+        }
 
         // Make a CUDA Graph. We use CUDA graph to minimize the overheads from
         // kernel launches
@@ -914,6 +1282,16 @@ greedy_ambiguity_resolution_algorithm::operator()(
     if (m_parallel_batch && m_batch_size_log != nullptr) {
         m_batch_size_log->assign(batch_sizes_this_call.begin(),
                                  batch_sizes_this_call.end());
+    }
+
+    // Tier 2c graph-mode logs.
+    if (m_graph_batch_log != nullptr) {
+        m_graph_batch_log->assign(graph_batches_this_call.begin(),
+                                  graph_batches_this_call.end());
+    }
+    if (m_graph_size_log != nullptr) {
+        m_graph_size_log->assign(graph_sizes_this_call.begin(),
+                                 graph_sizes_this_call.end());
     }
 
     cudaMemcpyAsync(&n_accepted, n_accepted_device.get(), sizeof(unsigned int),

@@ -226,6 +226,10 @@ int main(int argc, char* argv[]) {
     bool parallel_batch      = false;
     unsigned int parallel_batch_window = 8192u;
     std::string log_batch_sizes_path;
+    bool run_graph_mis       = false;
+    bool run_graph_jp        = false;
+    std::string log_graph_sizes_path;
+    std::string log_graph_batches_path;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -258,6 +262,22 @@ int main(int argc, char* argv[]) {
             log_batch_sizes_path = arg.substr(18);
             parallel_batch = true;
         }
+        else if (arg.find("--conflict-graph=") == 0) {
+            std::string v = arg.substr(17);
+            if (v == "mis") { run_graph_mis = true; }
+            else if (v == "jp") { run_graph_jp = true; }
+            else if (v == "both") { run_graph_mis = true; run_graph_jp = true; }
+            else {
+                std::cerr << "unknown --conflict-graph value: " << v << "\n";
+                return 2;
+            }
+        }
+        else if (arg.find("--log-graph-sizes=") == 0) {
+            log_graph_sizes_path = arg.substr(18);
+        }
+        else if (arg.find("--log-graph-batches=") == 0) {
+            log_graph_batches_path = arg.substr(20);
+        }
         else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "benchmark_resolver_cuda: GPU greedy ambiguity resolver benchmark\n"
@@ -272,6 +292,9 @@ int main(int argc, char* argv[]) {
                 << "  --parallel-batch      Also run the Tier 2a parallel batch greedy path\n"
                 << "  --parallel-batch-window=N   Candidate window size for PBG (default 8192)\n"
                 << "  --log-batch-sizes=<path.csv>  Write per-outer-iteration batch sizes to CSV\n"
+                << "  --conflict-graph=mis|jp|both  Tier 2c explicit-conflict-graph runs\n"
+                << "  --log-graph-batches=<path.csv> Write Tier 2c per-iter batch sizes\n"
+                << "  --log-graph-sizes=<path.csv>  Write Tier 2c per-iter |V|,|E|\n"
                 << "\nAdaptive n_it (default, no --n-it):\n"
                 << "  n_it per outer step = max(1, min(100, n_accepted/50))\n"
                 << "  Gives n=87 -> n_it~1, n=1000 -> n_it~10, n=10000 -> n_it=100\n"
@@ -428,13 +451,30 @@ int main(int argc, char* argv[]) {
         double track_overlap_vs_cpu = 0.0;
         double duplicate_rate_post = 0.0;
         std::vector<unsigned int> batch_sizes;
+        std::vector<std::pair<unsigned int, unsigned int>> graph_sizes;
     };
 
+    using graph_algo_t =
+        traccc::cuda::greedy_ambiguity_resolution_algorithm::graph_algo_t;
+
     auto run_one = [&](const std::string& label, bool use_pbg,
-                       std::vector<unsigned int>* batch_log) -> run_metrics {
-        gpu_resolver.set_parallel_batch_mode(use_pbg);
+                       graph_algo_t graph_algo,
+                       std::vector<unsigned int>* batch_log,
+                       std::vector<std::pair<unsigned int, unsigned int>>*
+                           graph_size_log) -> run_metrics {
+        // PBG and conflict-graph modes are mutually exclusive at the host
+        // level: enabling graph mode disables PBG on the resolver so the
+        // dispatcher picks the graph path.
+        gpu_resolver.set_parallel_batch_mode(
+            use_pbg && graph_algo == graph_algo_t::NONE);
         gpu_resolver.set_parallel_batch_window(parallel_batch_window);
-        gpu_resolver.set_batch_size_log(batch_log);
+        gpu_resolver.set_batch_size_log(
+            graph_algo == graph_algo_t::NONE ? batch_log : nullptr);
+        gpu_resolver.set_conflict_graph_mode(graph_algo);
+        gpu_resolver.set_graph_batch_log(
+            graph_algo != graph_algo_t::NONE ? batch_log : nullptr);
+        gpu_resolver.set_graph_size_log(
+            graph_algo != graph_algo_t::NONE ? graph_size_log : nullptr);
 
         for (std::size_t w = 0; w < warmup; ++w) {
             gpu_resolver(device_input);
@@ -506,19 +546,40 @@ int main(int argc, char* argv[]) {
         if (batch_log != nullptr) {
             m.batch_sizes = *batch_log;
         }
+        if (graph_size_log != nullptr) {
+            m.graph_sizes = *graph_size_log;
+        }
         return m;
     };
 
     // ------------------------------------------------------------------
     // Baseline run (always).
     // ------------------------------------------------------------------
-    const auto baseline = run_one("baseline", false, nullptr);
+    const auto baseline =
+        run_one("baseline", false, graph_algo_t::NONE, nullptr, nullptr);
 
     // Optional PBG run.
     std::optional<run_metrics> pbg;
     if (parallel_batch) {
         std::vector<unsigned int> pbg_batch_log;
-        pbg = run_one("parallel_batch", true, &pbg_batch_log);
+        pbg = run_one("parallel_batch", true, graph_algo_t::NONE,
+                      &pbg_batch_log, nullptr);
+    }
+
+    // Optional Tier 2c runs.
+    std::optional<run_metrics> graph_mis_run;
+    std::optional<run_metrics> graph_jp_run;
+    if (run_graph_mis) {
+        std::vector<unsigned int> mis_batches;
+        std::vector<std::pair<unsigned int, unsigned int>> mis_sizes;
+        graph_mis_run = run_one("graph_mis", false, graph_algo_t::LUBY_MIS,
+                                &mis_batches, &mis_sizes);
+    }
+    if (run_graph_jp) {
+        std::vector<unsigned int> jp_batches;
+        std::vector<std::pair<unsigned int, unsigned int>> jp_sizes;
+        graph_jp_run = run_one("graph_jp", false, graph_algo_t::JP_COLOR,
+                               &jp_batches, &jp_sizes);
     }
 
     double peak_mb = get_peak_rss_mb();
@@ -584,6 +645,80 @@ int main(int argc, char* argv[]) {
             }
             std::cout << "pbg_batch_size_log_written="
                       << log_batch_sizes_path << "\n";
+        }
+    }
+
+    auto dump_graph_metrics = [&](const run_metrics& m,
+                                  const std::string& prefix) {
+        dump_backend_metrics(m, prefix);
+        std::cout << prefix << "n_outer_iterations="
+                  << m.batch_sizes.size() << "\n";
+        if (!m.batch_sizes.empty()) {
+            double sum_b = 0.0;
+            unsigned int max_b = 0;
+            for (auto b : m.batch_sizes) {
+                sum_b += b;
+                if (b > max_b) max_b = b;
+            }
+            std::cout << prefix << "avg_batch_size="
+                      << (sum_b / static_cast<double>(m.batch_sizes.size()))
+                      << "\n"
+                      << prefix << "max_batch_size=" << max_b << "\n";
+        }
+        if (!m.graph_sizes.empty()) {
+            double sum_v = 0.0, sum_e = 0.0;
+            unsigned int max_v = 0u, max_e = 0u;
+            for (auto& ve : m.graph_sizes) {
+                sum_v += ve.first;
+                sum_e += ve.second;
+                if (ve.first > max_v) max_v = ve.first;
+                if (ve.second > max_e) max_e = ve.second;
+            }
+            const double n_iter =
+                static_cast<double>(m.graph_sizes.size());
+            std::cout << prefix << "avg_vertices=" << (sum_v / n_iter) << "\n"
+                      << prefix << "avg_edges=" << (sum_e / n_iter) << "\n"
+                      << prefix << "max_vertices=" << max_v << "\n"
+                      << prefix << "max_edges=" << max_e << "\n";
+        }
+    };
+
+    if (graph_mis_run) {
+        dump_graph_metrics(*graph_mis_run, "graph_mis_");
+        if (!log_graph_batches_path.empty()) {
+            std::ofstream f(log_graph_batches_path + ".mis.csv");
+            f << "outer_iter,batch_size\n";
+            for (std::size_t i = 0; i < graph_mis_run->batch_sizes.size(); ++i) {
+                f << i << "," << graph_mis_run->batch_sizes[i] << "\n";
+            }
+        }
+        if (!log_graph_sizes_path.empty()) {
+            std::ofstream f(log_graph_sizes_path + ".mis.csv");
+            f << "outer_iter,n_vertices,n_edges\n";
+            for (std::size_t i = 0; i < graph_mis_run->graph_sizes.size();
+                 ++i) {
+                f << i << "," << graph_mis_run->graph_sizes[i].first << ","
+                  << graph_mis_run->graph_sizes[i].second << "\n";
+            }
+        }
+    }
+    if (graph_jp_run) {
+        dump_graph_metrics(*graph_jp_run, "graph_jp_");
+        if (!log_graph_batches_path.empty()) {
+            std::ofstream f(log_graph_batches_path + ".jp.csv");
+            f << "outer_iter,batch_size\n";
+            for (std::size_t i = 0; i < graph_jp_run->batch_sizes.size(); ++i) {
+                f << i << "," << graph_jp_run->batch_sizes[i] << "\n";
+            }
+        }
+        if (!log_graph_sizes_path.empty()) {
+            std::ofstream f(log_graph_sizes_path + ".jp.csv");
+            f << "outer_iter,n_vertices,n_edges\n";
+            for (std::size_t i = 0; i < graph_jp_run->graph_sizes.size();
+                 ++i) {
+                f << i << "," << graph_jp_run->graph_sizes[i].first << ","
+                  << graph_jp_run->graph_sizes[i].second << "\n";
+            }
         }
     }
 
