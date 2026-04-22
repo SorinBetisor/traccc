@@ -10,6 +10,8 @@
 #include "../utils/utils.hpp"
 #include "./kernels/add_block_offset.cuh"
 #include "./kernels/apply_batch_removals.cuh"
+#include "./kernels/batch_commit.cuh"
+#include "./kernels/batch_confirm.cuh"
 #include "./kernels/batch_identify_removals.cuh"
 #include "./kernels/batch_prologue.cuh"
 #include "./kernels/block_inclusive_scan.cuh"
@@ -566,6 +568,19 @@ greedy_ambiguity_resolution_algorithm::operator()(
     vecmem::unique_alloc_ptr<unsigned int> batch_size_device =
         vecmem::make_unique_alloc<unsigned int>(m_mr.main);
 
+    // Snapshot of n_accepted taken by batch_prologue at the start of every
+    // graph replay. PBG identify and apply read this snapshot rather than the
+    // live n_accepted, eliminating an intra-grid race that otherwise causes
+    // distinct blocks to disagree on the candidate window.
+    vecmem::unique_alloc_ptr<unsigned int> n_acc_snapshot_device =
+        vecmem::make_unique_alloc<unsigned int>(m_mr.main);
+
+    // First-failure rank for the conflict-free prefix admission rule. Reset
+    // by batch_prologue, lowered by batch_confirm via atomicMin, read by
+    // apply_batch_removals to admit ranks [0, *first_fail).
+    vecmem::unique_alloc_ptr<unsigned int> first_fail_device =
+        vecmem::make_unique_alloc<unsigned int>(m_mr.main);
+
     // Per-outer-iteration batch size log (host-side buffer, populated after
     // each graph_replay burst).
     std::vector<unsigned int> batch_sizes_this_call;
@@ -636,7 +651,11 @@ greedy_ambiguity_resolution_algorithm::operator()(
                     .terminate = terminate_device.get(),
                     .max_shared = max_shared_device.get(),
                     .n_updated_tracks = n_updated_tracks_device.get(),
-                    .batch_size = batch_size_device.get()});
+                    .batch_size = batch_size_device.get(),
+                    .n_accepted = n_accepted_device.get(),
+                    .n_acc_snapshot = n_acc_snapshot_device.get(),
+                    .first_fail = first_fail_device.get(),
+                    .candidate_window_size = window});
 
             const unsigned int identify_threads = 256u;
             const unsigned int identify_blocks =
@@ -645,7 +664,7 @@ greedy_ambiguity_resolution_algorithm::operator()(
                                                identify_threads, 0, stream>>>(
                 device::batch_identify_removals_payload{
                     .sorted_ids_view = sorted_ids_buffer,
-                    .n_accepted = n_accepted_device.get(),
+                    .n_accepted = n_acc_snapshot_device.get(),
                     .meas_ids_view = meas_ids_buffer,
                     .meas_id_to_unique_id_view = meas_id_to_unique_id_buffer,
                     .n_accepted_tracks_per_measurement_view =
@@ -655,6 +674,28 @@ greedy_ambiguity_resolution_algorithm::operator()(
                     .terminate = terminate_device.get(),
                     .candidate_window_size = window});
 
+            // Confirm + first-fail computation. One thread per candidate.
+            // Output is *first_fail = min rank that failed the conflict-free
+            // prefix check (initialised to window by batch_prologue). apply
+            // admits ranks [0, *first_fail) — never a non-contiguous set.
+            const unsigned int confirm_threads = 256u;
+            const unsigned int confirm_blocks =
+                (window + confirm_threads - 1u) / confirm_threads;
+            kernels::batch_confirm<<<confirm_blocks, confirm_threads, 0,
+                                     stream>>>(
+                device::batch_confirm_payload{
+                    .sorted_ids_view = sorted_ids_buffer,
+                    .n_accepted = n_acc_snapshot_device.get(),
+                    .meas_ids_view = meas_ids_buffer,
+                    .meas_id_to_unique_id_view = meas_id_to_unique_id_buffer,
+                    .n_accepted_tracks_per_measurement_view =
+                        n_accepted_tracks_per_measurement_buffer,
+                    .n_shared_view = n_shared_buffer,
+                    .claimed_by_view = claimed_by_buffer,
+                    .terminate = terminate_device.get(),
+                    .candidate_window_size = window,
+                    .first_fail = first_fail_device.get()});
+
             const unsigned int apply_threads = 128u;
             const unsigned int apply_blocks =
                 (window + apply_threads - 1u) / apply_threads;
@@ -662,7 +703,7 @@ greedy_ambiguity_resolution_algorithm::operator()(
                                             stream>>>(
                 device::apply_batch_removals_payload{
                     .sorted_ids_view = sorted_ids_buffer,
-                    .n_accepted = n_accepted_device.get(),
+                    .n_accepted = n_acc_snapshot_device.get(),
                     .meas_ids_view = meas_ids_buffer,
                     .n_meas_view = n_meas_buffer,
                     .meas_id_to_unique_id_view = meas_id_to_unique_id_buffer,
@@ -682,7 +723,18 @@ greedy_ambiguity_resolution_algorithm::operator()(
                     .n_updated_tracks = n_updated_tracks_device.get(),
                     .updated_tracks_view = updated_tracks_buffer,
                     .is_updated_view = is_updated_buffer,
-                    .track_count_view = track_count_buffer});
+                    .track_count_view = track_count_buffer,
+                    .first_fail = first_fail_device.get()});
+
+            // Commit the per-iteration batch by subtracting batch_size from
+            // the live n_accepted. Must run after apply (so batch_size is
+            // final) and before any downstream kernel that reads n_accepted
+            // (sort_updated_tracks, fill_inverted_ids, update_status, ...).
+            kernels::batch_commit<<<1, 1, 0, stream>>>(
+                device::batch_commit_payload{
+                    .terminate = terminate_device.get(),
+                    .n_accepted = n_accepted_device.get(),
+                    .batch_size = batch_size_device.get()});
 
             kernels::update_rel_shared<<<
                 (n_tracks + (m_warp_size * 2) - 1) / (m_warp_size * 2),

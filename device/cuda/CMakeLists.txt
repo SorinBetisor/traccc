@@ -107,6 +107,10 @@ traccc_add_library( traccc_cuda cuda TYPE SHARED
   "src/ambiguity_resolution/kernels/batch_identify_removals.cuh"
   "src/ambiguity_resolution/kernels/apply_batch_removals.cu"
   "src/ambiguity_resolution/kernels/apply_batch_removals.cuh"
+  "src/ambiguity_resolution/kernels/batch_confirm.cu"
+  "src/ambiguity_resolution/kernels/batch_confirm.cuh"
+  "src/ambiguity_resolution/kernels/batch_commit.cu"
+  "src/ambiguity_resolution/kernels/batch_commit.cuh"
   "src/ambiguity_resolution/kernels/update_rel_shared.cu"
   "src/ambiguity_resolution/kernels/update_rel_shared.cuh"
   # Track fitting algorithm(s).

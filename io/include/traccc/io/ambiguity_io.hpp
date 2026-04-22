@@ -33,7 +33,7 @@ inline void write_ambiguity_input(
 }
 
 struct ambiguity_input_data {
-    edm::measurement_collection<default_algebra>::host measurements;
+    edm::measurement_collection::host measurements;
     edm::track_container<default_algebra>::host tracks;
     ambiguity_resolution_config config;
 

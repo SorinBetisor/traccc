@@ -112,13 +112,14 @@ ambiguity_input_data read_ambiguity_input(std::string_view path,
 
     result.measurements.reserve(j["measurements"].size());
     for (const auto& m : j["measurements"]) {
-        result.measurements.push_back({});
-        result.measurements.at(result.measurements.size() - 1).identifier() =
-            m["identifier"].get<measurement_id_type>();
+        const auto idx_back = result.measurements.size();
+        result.measurements.resize(idx_back + 1u);
+        edm::measurement meas = result.measurements.at(idx_back);
+        meas.identifier() = m["identifier"].get<measurement_id_type>();
     }
 
     std::unordered_map<measurement_id_type, std::size_t> id_to_idx;
-    edm::measurement_collection<default_algebra>::const_device meas_dev{
+    edm::measurement_collection::const_device meas_dev{
         vecmem::get_data(result.measurements)};
     for (std::size_t i = 0; i < result.measurements.size(); ++i) {
         id_to_idx[meas_dev.at(static_cast<unsigned int>(i)).identifier()] = i;

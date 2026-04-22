@@ -25,8 +25,11 @@ struct batch_identify_removals_payload {
     /// Sorted track ids (worst-first at the tail). Read-only.
     vecmem::data::vector_view<const unsigned int> sorted_ids_view;
 
-    /// Current number of accepted tracks.
-    unsigned int* n_accepted;
+    /// Snapshot of n_accepted taken by batch_prologue. Read-only here. The
+    /// live n_accepted is mutated only by the post-apply commit kernel, so
+    /// reading the snapshot guarantees every thread sees the same value
+    /// regardless of inter-block scheduling.
+    const unsigned int* n_accepted;
 
     /// Measurement ids per track (jagged). Read-only.
     vecmem::data::jagged_vector_view<const measurement_id_type> meas_ids_view;

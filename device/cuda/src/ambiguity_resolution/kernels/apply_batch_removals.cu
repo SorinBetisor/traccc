@@ -34,6 +34,14 @@ __global__ void apply_batch_removals(
         return;
     }
 
+    // Conflict-free prefix admission: only ranks strictly below first_fail
+    // are eligible. This keeps removed tracks at the contiguous tail of
+    // sorted_ids, which is the invariant the unchanged rearrange_tracks /
+    // update_status pipeline expects.
+    if (r >= *(payload.first_fail)) {
+        return;
+    }
+
     const unsigned int n_acc = *(payload.n_accepted);
     if (r >= n_acc) {
         return;
@@ -85,10 +93,11 @@ __global__ void apply_batch_removals(
         return;
     }
 
-    // --- admit: append to batch_ids and reserve an n_accepted slot.
+    // --- admit: append to batch_ids. The corresponding n_accepted decrement
+    // is deferred to batch_commit (single-thread post-kernel) so threads do
+    // not see drifting n_accepted values within this grid.
     const unsigned int slot = atomicAdd(payload.batch_size, 1u);
     batch_ids[slot] = t;
-    atomicSub(payload.n_accepted, 1u);
 
     // --- apply: measurement-level propagation (mirrors baseline remove_tracks
     // second half, but races only across distinct measurements because
@@ -98,8 +107,8 @@ __global__ void apply_batch_removals(
         const auto mid = mids[i];
         const unsigned int u = meas_id_to_unique_id[mid];
 
-        auto& tracks_on_u = tracks_per_measurement[u];
-        auto& status_on_u = track_status_per_measurement[u];
+        auto tracks_on_u = tracks_per_measurement[u];
+        auto status_on_u = track_status_per_measurement[u];
 
         // Flip my own status slot in the jagged tracks_per_measurement row.
         const unsigned int my_idx =

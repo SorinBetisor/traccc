@@ -25,8 +25,12 @@ struct apply_batch_removals_payload {
     /// Sorted track ids (worst-first at the tail).
     vecmem::data::vector_view<const unsigned int> sorted_ids_view;
 
-    /// Current number of accepted tracks (decremented by batch_size).
-    unsigned int* n_accepted;
+    /// Snapshot of n_accepted taken by batch_prologue. Read-only here; the
+    /// live n_accepted is mutated only by batch_commit, which runs after this
+    /// kernel completes. Reading the snapshot guarantees every thread in the
+    /// grid resolves the same sorted_ids[n_acc - 1 - r] for a given r,
+    /// independent of inter-block scheduling.
+    const unsigned int* n_accepted;
 
     /// Measurement ids per track.
     vecmem::data::jagged_vector_view<const measurement_id_type> meas_ids_view;
@@ -89,6 +93,13 @@ struct apply_batch_removals_payload {
     /// Scratch ref-count to detect "last one standing" duplicates among
     /// neighbours touched multiple times in the same iteration.
     vecmem::data::vector_view<int> track_count_view;
+
+    /// Read-only first-failure rank produced by batch_confirm. apply admits
+    /// only ranks r < *first_fail, i.e. the contiguous conflict-free prefix
+    /// of the worst tracks. Restricting admission to a prefix preserves the
+    /// invariant the downstream rearrange/update_status pipeline relies on
+    /// (removed tracks live at the tail of sorted_ids).
+    const unsigned int* first_fail;
 };
 
 }  // namespace traccc::device

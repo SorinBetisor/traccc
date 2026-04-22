@@ -38,7 +38,7 @@
 namespace {
 
 void fill_measurements(
-    traccc::edm::measurement_collection<traccc::default_algebra>::host& m,
+    traccc::edm::measurement_collection::host& m,
     traccc::measurement_id_type max_id) {
     m.reserve(max_id + 1);
     for (traccc::measurement_id_type i = 0; i <= max_id; i++) {
@@ -53,7 +53,7 @@ void fill_pattern(
     const std::vector<traccc::measurement_id_type>& pattern) {
     tc.tracks.resize(tc.tracks.size() + 1u);
     tc.tracks.pval().back() = pval;
-    traccc::edm::measurement_collection<traccc::default_algebra>::const_device
+    traccc::edm::measurement_collection::const_device
         meas{tc.measurements};
     for (traccc::measurement_id_type meas_id : pattern) {
         auto it = std::lower_bound(meas.identifier().begin(),
@@ -70,7 +70,7 @@ void fill_pattern(
 std::string compute_hash_host(
     const traccc::edm::track_container<traccc::default_algebra>::host& out) {
     std::vector<std::vector<traccc::measurement_id_type>> patterns;
-    traccc::edm::measurement_collection<traccc::default_algebra>::const_device
+    traccc::edm::measurement_collection::const_device
         meas{out.measurements};
     for (std::size_t i = 0; i < out.tracks.size(); ++i) {
         std::vector<traccc::measurement_id_type> p;
@@ -96,8 +96,8 @@ std::string compute_hash_buffer(
     const traccc::edm::track_container<traccc::default_algebra>::buffer& buf) {
     traccc::edm::track_container<traccc::default_algebra>::const_device dev{
         buf};
-    const traccc::edm::measurement_collection<
-        traccc::default_algebra>::const_device meas{buf.measurements};
+    const traccc::edm::measurement_collection::const_device meas{
+        buf.measurements};
     std::vector<std::vector<traccc::measurement_id_type>> patterns;
     for (std::uint32_t i = 0;
          i < static_cast<std::uint32_t>(dev.tracks.size()); ++i) {
@@ -124,7 +124,7 @@ std::string compute_hash_buffer(
 std::set<std::vector<traccc::measurement_id_type>> extract_patterns_host(
     const traccc::edm::track_container<traccc::default_algebra>::host& out) {
     std::set<std::vector<traccc::measurement_id_type>> patterns;
-    traccc::edm::measurement_collection<traccc::default_algebra>::const_device
+    traccc::edm::measurement_collection::const_device
         meas{out.measurements};
     for (std::size_t i = 0; i < out.tracks.size(); ++i) {
         std::vector<traccc::measurement_id_type> p;
@@ -143,8 +143,8 @@ std::set<std::vector<traccc::measurement_id_type>> extract_patterns_buffer(
     std::set<std::vector<traccc::measurement_id_type>> patterns;
     traccc::edm::track_container<traccc::default_algebra>::const_device dev{
         buf};
-    const traccc::edm::measurement_collection<
-        traccc::default_algebra>::const_device meas{buf.measurements};
+    const traccc::edm::measurement_collection::const_device meas{
+        buf.measurements};
     for (std::uint32_t i = 0;
          i < static_cast<std::uint32_t>(dev.tracks.size()); ++i) {
         std::vector<traccc::measurement_id_type> p;
@@ -298,7 +298,7 @@ int main(int argc, char* argv[]) {
 
     std::optional<traccc::io::ambiguity_input_data> dump_data;
     std::optional<
-        traccc::edm::measurement_collection<traccc::default_algebra>::host>
+        traccc::edm::measurement_collection::host>
         synthetic_measurements;
 
     if (!input_dump.empty()) {
@@ -357,7 +357,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Pointer to host measurement collection (valid for lifetime of benchmark)
-    traccc::edm::measurement_collection<traccc::default_algebra>::host*
+    traccc::edm::measurement_collection::host*
         meas_host_ptr = synthetic_measurements
                             ? &(*synthetic_measurements)
                             : &dump_data->measurements;
