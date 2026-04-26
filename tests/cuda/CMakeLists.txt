@@ -33,6 +33,7 @@ traccc_add_test(
 
     # Define the sources for the test.
     test_ambiguity_resolution.cpp
+    test_ambiguity_resolution_jp.cpp
     test_basic.cu
     test_barrier.cu
     test_cca.cpp
