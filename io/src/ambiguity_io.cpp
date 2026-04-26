@@ -140,6 +140,29 @@ ambiguity_input_data read_ambiguity_input(std::string_view path,
         }
     }
 
+    // Remap identifiers to dense [0, N-1].
+    //
+    // The dump file preserves each measurement's original global identifier
+    // (e.g. from a Fatras / Geant4 simulation) so that downstream tools can
+    // cross-reference the original event. The GPU greedy resolver, however,
+    // requires identifiers to form a contiguous [0, n_measurements - 1]
+    // range because it uses them as direct indices into a per-measurement
+    // working array (see device/cuda/src/ambiguity_resolution/
+    // greedy_ambiguity_resolution_algorithm.cu: the
+    // "max measurement id should be equal to (the number of measurements
+    // - 1)" invariant). The conflict-graph structure only depends on which
+    // tracks share which measurement, not on the absolute identifier
+    // value, so remapping to dense indices here preserves the resolver
+    // semantics while satisfying the invariant. The constituent_links
+    // above already reference dense indices via id_to_idx, so we only
+    // need to overwrite the per-measurement identifier field.
+    edm::measurement_collection::device meas_dev_mut{
+        vecmem::get_data(result.measurements)};
+    for (std::size_t i = 0; i < result.measurements.size(); ++i) {
+        edm::measurement m = meas_dev_mut.at(static_cast<unsigned int>(i));
+        m.identifier() = static_cast<measurement_id_type>(i);
+    }
+
     return result;
 }
 
