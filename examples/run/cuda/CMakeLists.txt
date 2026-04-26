@@ -10,6 +10,10 @@ include( traccc-compiler-options-cuda )
 # External(s).
 find_package( CUDAToolkit REQUIRED )
 
+traccc_add_executable( benchmark_resolver_cuda "benchmark_resolver_cuda.cpp"
+   LINK_LIBRARIES vecmem::core vecmem::cuda traccc::core traccc::io
+                  traccc::device_common traccc::cuda_utils traccc::cuda )
+
 #
 # Set up the "throughput applications".
 #
