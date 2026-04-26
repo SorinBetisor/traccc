@@ -23,8 +23,12 @@
 #include <gtest/gtest.h>
 
 // System include(s).
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <map>
 #include <random>
+#include <set>
 #include <thread>
 
 using namespace traccc;
@@ -805,7 +809,6 @@ TEST_P(CUDAGreedyResolutionCompareToCPU, Comparison) {
             const std::size_t track_length = track_length_dist(gen);
             const traccc::scalar pval = pval_dist(gen);
             std::vector<measurement_id_type> pattern;
-            // std::cout << pval << std::endl;
             while (pattern.size() < track_length) {
 
                 auto mid = meas_id_dist(gen);
@@ -816,10 +819,8 @@ TEST_P(CUDAGreedyResolutionCompareToCPU, Comparison) {
                         mid = meas_id_dist(gen);
                     }
                 }
-                // std::cout << mid << ", ";
                 pattern.push_back(mid);
             }
-            // std::cout << std::endl;
 
             // Make sure that partern size is eqaul to the track length
             ASSERT_EQ(pattern.size(), track_length);
