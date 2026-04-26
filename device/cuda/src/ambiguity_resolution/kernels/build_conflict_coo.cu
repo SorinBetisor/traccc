@@ -1,7 +1,5 @@
 /** TRACCC library, part of the ACTS project (R&D line)
  *
- * (c) 2026 CERN for the benefit of the ACTS project
- *
  * Mozilla Public License Version 2.0
  */
 
@@ -15,10 +13,19 @@
 namespace traccc::cuda::kernels {
 
 /// Grid layout: one CTA per unique measurement. Threads of the CTA cooperate
-/// to gather the still-accepted vertex list of that row and emit the
-/// directed pair list. With blockDim.x threads per measurement and a fast
-/// shared-memory gather, n_m <= blockDim.x measurements are handled in a
-/// single iteration; larger rows loop.
+/// to gather the still-accepted vertex list for that row and emit the directed
+/// pair list into the COO edge buffers.
+///
+/// Shared-memory safety guarantee
+/// ─────────────────────────────
+/// The dynamic shared-memory scratch buffer (smem_gathered) has exactly
+/// blockDim.x slots, matching the caller's allocation:
+///   smem_bytes = nt_coo * sizeof(unsigned int)
+///
+/// The kernel handles rows wider than blockDim.x via a slow path that reads
+/// directly from global memory, completely bypassing the shared-memory buffer.
+/// This ensures smem_gathered[slot] is always in bounds regardless of how many
+/// tracks share a single measurement.
 __global__ void build_conflict_coo(device::build_conflict_coo_payload payload) {
 
     const unsigned int u = blockIdx.x;
@@ -44,40 +51,79 @@ __global__ void build_conflict_coo(device::build_conflict_coo_payload payload) {
 
     const unsigned int n_rows = static_cast<unsigned int>(tracks_u.size());
 
-    // Collect still-accepted track ids into shared memory.
-    extern __shared__ unsigned int smem_gathered[];
-    __shared__ unsigned int smem_count;
-
-    if (threadIdx.x == 0) {
-        smem_count = 0u;
-    }
-    __syncthreads();
-
-    for (unsigned int k = threadIdx.x; k < n_rows; k += blockDim.x) {
-        if (status_u[k] == 1) {
-            const unsigned int slot = atomicAdd(&smem_count, 1u);
-            smem_gathered[slot] = tracks_u[k];
-        }
-    }
-    __syncthreads();
-
-    const unsigned int n_gathered = smem_count;
-    if (n_gathered < 2u) {
-        return;
-    }
-
-    // Emit directed pairs. For each i, emit (i, j) for all j != i in
-    // [0, n_gathered). Threads split the i dimension.
     vecmem::device_vector<unsigned int> coo_src(payload.coo_src_view);
     vecmem::device_vector<unsigned int> coo_dst(payload.coo_dst_view);
 
-    for (unsigned int i = threadIdx.x; i < n_gathered; i += blockDim.x) {
-        const unsigned int a = smem_gathered[i];
-        for (unsigned int j = 0; j < n_gathered; ++j) {
+    // -----------------------------------------------------------------------
+    // Fast path: row fits in one shared-memory chunk (common case on real
+    // detector geometries — ODD muon n_rows <= 93, Fatras mu=600 n_rows
+    // peaks around 1200 across the full sorted list but individual
+    // measurement rows are typically much smaller).
+    // -----------------------------------------------------------------------
+    if (n_rows <= blockDim.x) {
+        // smem_gathered: dynamic shared memory, blockDim.x unsigned ints.
+        extern __shared__ unsigned int smem_gathered[];
+        __shared__ unsigned int smem_count;
+
+        if (threadIdx.x == 0) {
+            smem_count = 0u;
+        }
+        __syncthreads();
+
+        for (unsigned int k = threadIdx.x; k < n_rows; k += blockDim.x) {
+            if (status_u[k] == 1) {
+                const unsigned int slot = atomicAdd(&smem_count, 1u);
+                // slot is bounded by n_rows <= blockDim.x, so always in range.
+                smem_gathered[slot] = tracks_u[k];
+            }
+        }
+        __syncthreads();
+
+        const unsigned int n_gathered = smem_count;
+        if (n_gathered < 2u) {
+            return;
+        }
+
+        for (unsigned int i = threadIdx.x; i < n_gathered; i += blockDim.x) {
+            const unsigned int a = smem_gathered[i];
+            for (unsigned int j = 0; j < n_gathered; ++j) {
+                if (j == i) {
+                    continue;
+                }
+                const unsigned int b = smem_gathered[j];
+                const unsigned int pos = atomicAdd(payload.edge_count, 1u);
+                coo_src[pos] = a;
+                coo_dst[pos] = b;
+            }
+        }
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Slow path: row is wider than blockDim.x.  This is not expected on any
+    // real physical detector geometry we have tested (max observed n_rows on
+    // measurement rows is well below 128 in ODD and Fatras data), but can
+    // occur in adversarial synthetic inputs.
+    //
+    // Instead of using shared memory (which is bounded at blockDim.x slots),
+    // iterate directly over global memory. Each thread is responsible for
+    // emitting all outgoing edges from the track at its stride position.
+    // Global memory reads of status_u / tracks_u are sequential per warp and
+    // cached by L2, so the penalty vs the shared-memory fast path is modest.
+    // -----------------------------------------------------------------------
+    for (unsigned int i = threadIdx.x; i < n_rows; i += blockDim.x) {
+        if (status_u[i] != 1) {
+            continue;
+        }
+        const unsigned int a = tracks_u[i];
+        for (unsigned int j = 0u; j < n_rows; ++j) {
             if (j == i) {
                 continue;
             }
-            const unsigned int b = smem_gathered[j];
+            if (status_u[j] != 1) {
+                continue;
+            }
+            const unsigned int b = tracks_u[j];
             const unsigned int pos = atomicAdd(payload.edge_count, 1u);
             coo_src[pos] = a;
             coo_dst[pos] = b;

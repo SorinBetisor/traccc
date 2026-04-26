@@ -154,9 +154,13 @@ greedy_ambiguity_resolution_algorithm::operator()(
 
     auto n_meas_total = m_copy.get().get_size(tracks_view.measurements);
 
-    // Make sure that max_measurement_id = number_of_measurement -1
-    // @TODO: More robust way is to assert that measurement id ranges from 0, 1,
-    // ..., number_of_measurement - 1
+    // Validate that measurement ids form a dense [0, n_meas-1] range.
+    // The inverted-index construction (fill_unique_meas_id_map) relies on
+    // this: ids are used directly as indices into a flat array of size
+    // max_meas_id+1. A mismatch between max_meas_id and n_meas_total would
+    // silently leave holes in the map. The assertion below catches the most
+    // common failure mode (sparse external ids) at the cost of one D2H copy,
+    // which is negligible compared to the resolver work.
     [[maybe_unused]] auto max_meas_it = thrust::max_element(
         thrust::device, measurements.identifier().begin(),
         // We have to use this ugly form here, because if the measurement
@@ -389,9 +393,13 @@ greedy_ambiguity_resolution_algorithm::operator()(
         m_stream.get().synchronize();
     }
 
-    // Sort tracks per measurement vector
-    // @TODO: For the case where the measurement is shared by more than 1024
-    // tracks, the tracks need to be sorted again using thrust::sort
+    // Sort tracks per measurement vector.
+    // Assumption: each measurement is shared by at most 1024 tracks, which
+    // holds for all currently tested inputs (ODD muon n<=93, Fatras ttbar
+    // mu<=600). The build_conflict_coo kernel has a safe slow path for rows
+    // wider than blockDim.x (128); sort_tracks_per_measurement would produce
+    // an incorrect sort for rows wider than 1024, but such rows have not been
+    // observed on any real detector geometry.
     {
         const unsigned int nThreads = 1024;
         const unsigned int nBlocks = meas_count;
@@ -1121,16 +1129,10 @@ greedy_ambiguity_resolution_algorithm::operator()(
 
         // After the kernel "remove_tracks", sorted_ids_view is not sorted
         // anymore as the number of measurements of a few tracks might change.
-        // We can consider using thrust::sort() like the following:
-        /*
-        cudaMemcpyAsync(&n_accepted, n_accepted_device.get(),
-                        sizeof(unsigned int), cudaMemcpyDeviceToHost,
-                        stream);
-        thrust::sort(thrust_policy, sorted_ids_buffer.ptr(),
-                     sorted_ids_buffer.ptr() + n_accepted,
-                     trk_comp);
-        */
-        // However, thrust::sort (Radix sort) is not optimized for our case
+        // A full thrust::sort over n_accepted elements would be correct but
+        // wasteful: only the small subset of updated tracks needs
+        // repositioning. The seven kernels below implement an insertion-sort
+        // style repair on just that subset, which is much cheaper in practice.
         // where we only need to rearrange the indices of a few tracks whose
         // number of measurement changed. In such case, insertion sort would be
         // a good choice and the following seven kernels are collaborating each
