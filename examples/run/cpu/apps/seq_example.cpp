@@ -13,6 +13,7 @@
 #include "traccc/utils/propagation.hpp"
 
 // io
+#include "traccc/io/ambiguity_io.hpp"
 #include "traccc/io/read_cells.hpp"
 #include "traccc/io/read_detector.hpp"
 #include "traccc/io/read_detector_description.hpp"
@@ -294,6 +295,14 @@ int seq_run(const traccc::opts::input_data& input_opts,
                     traccc::edm::track_container<
                         traccc::default_algebra>::const_data(track_candidates),
                     polymorphic_detector);
+            }
+
+            if (!output_opts.dump_ambiguity_input.empty()) {
+                traccc::io::write_ambiguity_input(
+                    output_opts.dump_ambiguity_input,
+                    traccc::edm::track_container<
+                        traccc::default_algebra>::const_data(track_candidates),
+                    resolution_config);
             }
 
             {
