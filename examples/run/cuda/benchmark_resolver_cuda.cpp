@@ -1,8 +1,11 @@
-/**
- * GPU resolver benchmark harness.
- * Matches the output format of benchmark_resolver.cpp (CPU) so results can be
- * compared directly.  Extra fields: backend=gpu, time_h2d_ms, time_d2h_ms,
- * cpu_hash, gpu_hash, hash_match.
+/** TRACCC library, part of the ACTS project (R&D line)
+ *
+ * Mozilla Public License Version 2.0
+ *
+ * GPU resolver benchmark harness.  Matches the output format of
+ * benchmark_resolver.cpp (CPU) so results can be compared directly.  Extra
+ * fields: backend=gpu, time_h2d_ms, time_d2h_ms, cpu_hash, gpu_hash,
+ * hash_match.
  */
 
 #include <algorithm>
@@ -62,7 +65,25 @@ void fill_pattern(
     }
 }
 
-/// Compute a deterministic hash of the selected-track measurement patterns.
+/// Stable, portable FNV-1a 64-bit hash of a string.
+/// std::hash<std::string> is explicitly non-portable across compilers and
+/// standard library versions. FNV-1a is deterministic, widely documented,
+/// and produces the same output on any conforming C++17 implementation.
+std::uint64_t fnv1a_64(const std::string& s) {
+    constexpr std::uint64_t FNV_OFFSET = 14695981039346656037ULL;
+    constexpr std::uint64_t FNV_PRIME  = 1099511628211ULL;
+    std::uint64_t h = FNV_OFFSET;
+    for (char raw : s) {
+        h ^= static_cast<std::uint64_t>(static_cast<unsigned char>(raw));
+        h *= FNV_PRIME;
+    }
+    return h;
+}
+
+/// Compute a stable, portable hash of the selected-track measurement patterns.
+/// The hash identifies the **selection** (set of tracks by sorted
+/// measurement-id pattern), not the raw output bytes. Two runs producing the
+/// same selection but in different order will have the same hash.
 /// Works on a host track_container (CPU reference or after D2H).
 std::string compute_hash_host(
     const traccc::edm::track_container<traccc::default_algebra>::host& out) {
@@ -84,7 +105,7 @@ std::string compute_hash_host(
             oss << id << ",";
         oss << ";";
     }
-    return std::to_string(std::hash<std::string>{}(oss.str()));
+    return std::to_string(fnv1a_64(oss.str()));
 }
 
 /// Compute hash from a track_container buffer that has been copied to host
@@ -113,7 +134,7 @@ std::string compute_hash_buffer(
             oss << id << ",";
         oss << ";";
     }
-    return std::to_string(std::hash<std::string>{}(oss.str()));
+    return std::to_string(fnv1a_64(oss.str()));
 }
 
 /// Extract the set of sorted measurement-id patterns that identify the
@@ -225,6 +246,8 @@ int main(int argc, char* argv[]) {
     bool run_graph_jp = false;
     std::string log_graph_sizes_path;
     std::string log_graph_batches_path;
+    std::size_t determinism_runs = 0;
+    std::string truth_file;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -271,6 +294,10 @@ int main(int argc, char* argv[]) {
             log_graph_sizes_path = arg.substr(18);
         } else if (arg.find("--log-graph-batches=") == 0) {
             log_graph_batches_path = arg.substr(20);
+        } else if (arg.find("--determinism-runs=") == 0) {
+            determinism_runs = std::stoull(arg.substr(19));
+        } else if (arg.find("--truth-file=") == 0) {
+            truth_file = arg.substr(13);
         } else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "benchmark_resolver_cuda: GPU greedy ambiguity resolver "
@@ -298,6 +325,16 @@ int main(int argc, char* argv[]) {
                    "batch sizes\n"
                 << "  --log-graph-sizes=<path.csv>  Write Tier 2c per-iter "
                    "|V|,|E|\n"
+                << "  --determinism-runs=N  Run each enabled GPU backend N "
+                   "extra times and assert selection-identical output on every "
+                   "run (validates determinism; default 0 = disabled)\n"
+                << "  --truth-file=<path>   TSV file with per-track truth "
+                   "association: one line per input track, columns: "
+                   "track_idx<TAB>particle_id (-1 = fake/unmatched). "
+                   "Enables efficiency and fake-rate reporting.\n"
+                   "  Truth file format: generated alongside Fatras dumps "
+                   "from particles.csv + truth_hits.csv using the companion "
+                   "script scripts/make_truth_file.py\n"
                 << "\nAdaptive n_it (default, no --n-it):\n"
                 << "  n_it per outer step = max(1, min(100, n_accepted/50))\n"
                 << "  Gives n=87 -> n_it~1, n=1000 -> n_it~10, n=10000 -> "
@@ -446,6 +483,40 @@ int main(int argc, char* argv[]) {
     // ------------------------------------------------------------------
     // Per-backend run helper. Captures warmup + timed loop + D2H + metrics.
     // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Optional truth association (--truth-file).
+    // File format: one tab-separated line per input track (in order of
+    // track index as written by write_ambiguity_input / synthetic gen):
+    //   <track_idx>\t<particle_id>
+    // particle_id == -1 means the track is a fake (no truth particle).
+    // ------------------------------------------------------------------
+    std::vector<long long> truth_particle_ids;  // index = track_idx
+    bool has_truth = false;
+    if (!truth_file.empty()) {
+        std::ifstream tf(truth_file);
+        if (!tf) {
+            std::cerr << "WARNING: cannot open truth file " << truth_file
+                      << " — truth metrics disabled\n";
+        } else {
+            std::string line;
+            while (std::getline(tf, line)) {
+                if (line.empty() || line[0] == '#') {
+                    continue;
+                }
+                std::istringstream iss(line);
+                std::size_t idx;
+                long long pid;
+                if (iss >> idx >> pid) {
+                    if (idx >= truth_particle_ids.size()) {
+                        truth_particle_ids.resize(idx + 1, -2LL);
+                    }
+                    truth_particle_ids[idx] = pid;
+                }
+            }
+            has_truth = true;
+        }
+    }
+
     struct run_metrics {
         std::string label;
         double mean_ms = 0.0, std_ms = 0.0, median_ms = 0.0, p95_ms = 0.0;
@@ -455,6 +526,9 @@ int main(int argc, char* argv[]) {
         bool hash_match = false;
         double track_overlap_vs_cpu = 0.0;
         double duplicate_rate_post = 0.0;
+        // Truth-based metrics (populated only when --truth-file is provided).
+        double selection_efficiency = -1.0;  // |selected matched| / |all matched|
+        double fake_rate = -1.0;             // |selected fakes| / |selected|
         std::vector<unsigned int> batch_sizes;
         std::vector<std::pair<unsigned int, unsigned int>> graph_sizes;
     };
@@ -548,6 +622,58 @@ int main(int argc, char* argv[]) {
             track_selection_overlap(gpu_patterns, cpu_patterns);
         m.duplicate_rate_post = duplicate_rate(gpu_patterns);
 
+        // Truth-based metrics: requires truth_particle_ids to be populated.
+        // Each track is identified by its sorted measurement-id pattern.
+        // We map patterns to truth status using the input track order.
+        if (has_truth && !truth_particle_ids.empty()) {
+            // Build a pattern -> truth_pid map from the input tracks.
+            std::map<std::vector<traccc::measurement_id_type>, long long>
+                pattern_to_pid;
+            traccc::edm::measurement_collection::const_device in_meas{
+                input_tracks->measurements};
+            for (std::size_t ti = 0; ti < input_tracks->tracks.size(); ++ti) {
+                std::vector<traccc::measurement_id_type> p;
+                for (const auto& [type, idx] :
+                     input_tracks->tracks.at(ti).constituent_links()) {
+                    if (type == traccc::edm::track_constituent_link::measurement)
+                        p.push_back(in_meas.at(idx).identifier());
+                }
+                std::sort(p.begin(), p.end());
+                long long pid = (ti < truth_particle_ids.size())
+                                    ? truth_particle_ids[ti]
+                                    : -1LL;
+                pattern_to_pid[p] = pid;
+            }
+
+            // Count matched (particle_id >= 0) and fake (particle_id == -1)
+            // tracks in the input and in the selected set.
+            std::size_t n_input_matched = 0;
+            for (const auto& [pat, pid] : pattern_to_pid) {
+                if (pid >= 0) ++n_input_matched;
+            }
+
+            std::size_t n_selected_matched = 0, n_selected_fake = 0;
+            for (const auto& pat : gpu_patterns) {
+                auto it = pattern_to_pid.find(pat);
+                long long pid = (it != pattern_to_pid.end()) ? it->second : -1LL;
+                if (pid >= 0)
+                    ++n_selected_matched;
+                else
+                    ++n_selected_fake;
+            }
+
+            m.selection_efficiency =
+                n_input_matched > 0
+                    ? static_cast<double>(n_selected_matched) /
+                          static_cast<double>(n_input_matched)
+                    : 1.0;
+            m.fake_rate =
+                m.n_selected > 0
+                    ? static_cast<double>(n_selected_fake) /
+                          static_cast<double>(m.n_selected)
+                    : 0.0;
+        }
+
         if (batch_log != nullptr) {
             m.batch_sizes = *batch_log;
         }
@@ -587,6 +713,75 @@ int main(int argc, char* argv[]) {
                                &jp_batches, &jp_sizes);
     }
 
+    // ------------------------------------------------------------------
+    // Determinism check (optional, --determinism-runs=N)
+    // Runs each enabled backend N additional times on the same frozen input
+    // and asserts that every run produces a selection-identical output.
+    // ------------------------------------------------------------------
+    struct determinism_result {
+        std::string label;
+        std::size_t n_runs  = 0;
+        std::size_t n_pass  = 0;
+        std::size_t n_fail  = 0;
+    };
+    std::vector<determinism_result> det_results;
+
+    if (determinism_runs > 0) {
+        auto check_determinism =
+            [&](const std::string& label, const std::string& reference_hash,
+                bool use_pbg, graph_algo_t graph_algo) -> determinism_result {
+            determinism_result dr;
+            dr.label = label;
+            dr.n_runs = determinism_runs;
+            gpu_resolver.set_parallel_batch_mode(use_pbg &&
+                                                 graph_algo == graph_algo_t::NONE);
+            gpu_resolver.set_parallel_batch_window(parallel_batch_window);
+            gpu_resolver.set_batch_size_log(nullptr);
+            gpu_resolver.set_conflict_graph_mode(graph_algo);
+            gpu_resolver.set_graph_batch_log(nullptr);
+            gpu_resolver.set_graph_size_log(nullptr);
+
+            for (std::size_t r = 0; r < determinism_runs; ++r) {
+                auto det_buf = gpu_resolver(device_input);
+                stream.synchronize();
+                traccc::edm::track_container<
+                    traccc::default_algebra>::buffer det_host{
+                    copy.to(det_buf.tracks, host_mr, nullptr,
+                            vecmem::copy::type::device_to_host),
+                    {},
+                    vecmem::get_data(*meas_host_ptr)};
+                stream.synchronize();
+                const std::string run_hash = compute_hash_buffer(det_host);
+                if (run_hash == reference_hash) {
+                    ++dr.n_pass;
+                } else {
+                    ++dr.n_fail;
+                    std::cerr << "DETERMINISM FAIL: " << label << " run " << r
+                              << " hash=" << run_hash
+                              << " expected=" << reference_hash << "\n";
+                }
+            }
+            return dr;
+        };
+
+        det_results.push_back(check_determinism(
+            "baseline", baseline.gpu_hash, false, graph_algo_t::NONE));
+        if (pbg) {
+            det_results.push_back(check_determinism(
+                "parallel_batch", pbg->gpu_hash, true, graph_algo_t::NONE));
+        }
+        if (graph_mis_run) {
+            det_results.push_back(
+                check_determinism("graph_mis", graph_mis_run->gpu_hash, false,
+                                  graph_algo_t::LUBY_MIS));
+        }
+        if (graph_jp_run) {
+            det_results.push_back(
+                check_determinism("graph_jp", graph_jp_run->gpu_hash, false,
+                                  graph_algo_t::JP_COLOR));
+        }
+    }
+
     double peak_mb = get_peak_rss_mb();
 
     auto dump_backend_metrics = [&](const run_metrics& m,
@@ -607,6 +802,11 @@ int main(int argc, char* argv[]) {
                   << "\n"
                   << prefix << "duplicate_rate_post=" << m.duplicate_rate_post
                   << "\n";
+        if (m.selection_efficiency >= 0.0) {
+            std::cout << prefix
+                      << "selection_efficiency=" << m.selection_efficiency << "\n"
+                      << prefix << "fake_rate=" << m.fake_rate << "\n";
+        }
     };
 
     std::cout << "backend=gpu\n"
@@ -742,6 +942,25 @@ int main(int argc, char* argv[]) {
               << "gpu_hash=" << baseline.gpu_hash << "\n"
               << "hash_match=" << (baseline.hash_match ? "true" : "false")
               << "\n";
+
+    // Determinism summary output.
+    if (!det_results.empty()) {
+        std::cout << "determinism_runs=" << determinism_runs << "\n";
+        bool all_pass = true;
+        for (const auto& dr : det_results) {
+            std::cout << "det_" << dr.label << "_pass=" << dr.n_pass
+                      << " det_" << dr.label << "_fail=" << dr.n_fail << "\n";
+            if (dr.n_fail > 0) {
+                all_pass = false;
+            }
+        }
+        std::cout << "determinism_all_pass=" << (all_pass ? "true" : "false")
+                  << "\n";
+        if (!all_pass) {
+            std::cerr << "DETERMINISM: some runs produced non-identical "
+                         "selections — see det_*_fail fields above.\n";
+        }
+    }
 
     if (!baseline.hash_match)
         std::cerr
