@@ -48,9 +48,9 @@ void fill_pattern(edm::track_container<default_algebra>::host& trk_cands,
     edm::measurement_collection::const_device measurements{
         trk_cands.measurements};
     for (const auto& meas_id : pattern) {
-        const auto it = std::lower_bound(measurements.identifier().begin(),
-                                         measurements.identifier().end(),
-                                         meas_id);
+        const auto it =
+            std::lower_bound(measurements.identifier().begin(),
+                             measurements.identifier().end(), meas_id);
         const auto idx = static_cast<measurement_id_type>(
             std::distance(measurements.identifier().begin(), it));
         trk_cands.tracks.constituent_links().back().push_back(
@@ -150,8 +150,8 @@ TEST(CUDAJonesPlassmannResolverTests, SelectionIdenticalToCPU_Tiny) {
     // CPU reference.
     traccc::host::greedy_ambiguity_resolution_algorithm::config_type cfg;
     traccc::host::greedy_ambiguity_resolution_algorithm cpu_alg(cfg, mng_mr);
-    auto cpu_res = cpu_alg(
-        edm::track_container<default_algebra>::const_data(trk_cands));
+    auto cpu_res =
+        cpu_alg(edm::track_container<default_algebra>::const_data(trk_cands));
     const auto cpu_set = sorted_track_set_host(cpu_res);
 
     // GPU JP backend.
@@ -160,8 +160,8 @@ TEST(CUDAJonesPlassmannResolverTests, SelectionIdenticalToCPU_Tiny) {
     gpu_alg.set_conflict_graph_mode(
         traccc::cuda::greedy_ambiguity_resolution_algorithm::graph_algo_t::JP);
 
-    auto gpu_buf = gpu_alg(
-        edm::track_container<default_algebra>::const_data(trk_cands));
+    auto gpu_buf =
+        gpu_alg(edm::track_container<default_algebra>::const_data(trk_cands));
     stream.synchronize();
     edm::track_container<default_algebra>::const_device gpu_dev{gpu_buf};
     const auto jp_set = sorted_track_set_device(gpu_dev);

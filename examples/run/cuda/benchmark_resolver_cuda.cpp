@@ -71,7 +71,7 @@ void fill_pattern(
 /// and produces the same output on any conforming C++17 implementation.
 std::uint64_t fnv1a_64(const std::string& s) {
     constexpr std::uint64_t FNV_OFFSET = 14695981039346656037ULL;
-    constexpr std::uint64_t FNV_PRIME  = 1099511628211ULL;
+    constexpr std::uint64_t FNV_PRIME = 1099511628211ULL;
     std::uint64_t h = FNV_OFFSET;
     for (char raw : s) {
         h ^= static_cast<std::uint64_t>(static_cast<unsigned char>(raw));
@@ -498,8 +498,9 @@ int main(int argc, char* argv[]) {
         double track_overlap_vs_cpu = 0.0;
         double duplicate_rate_post = 0.0;
         // Truth-based metrics (populated only when --truth-file is provided).
-        double selection_efficiency = -1.0;  // |selected matched| / |all matched|
-        double fake_rate = -1.0;             // |selected fakes| / |selected|
+        double selection_efficiency =
+            -1.0;                 // |selected matched| / |all matched|
+        double fake_rate = -1.0;  // |selected fakes| / |selected|
         std::vector<unsigned int> batch_sizes;
         std::vector<std::pair<unsigned int, unsigned int>> graph_sizes;
     };
@@ -599,7 +600,8 @@ int main(int argc, char* argv[]) {
                 std::vector<traccc::measurement_id_type> p;
                 for (const auto& [type, idx] :
                      input_tracks->tracks.at(ti).constituent_links()) {
-                    if (type == traccc::edm::track_constituent_link::measurement)
+                    if (type ==
+                        traccc::edm::track_constituent_link::measurement)
                         p.push_back(in_meas.at(idx).identifier());
                 }
                 std::sort(p.begin(), p.end());
@@ -613,13 +615,15 @@ int main(int argc, char* argv[]) {
             // tracks in the input and in the selected set.
             std::size_t n_input_matched = 0;
             for (const auto& [pat, pid] : pattern_to_pid) {
-                if (pid >= 0) ++n_input_matched;
+                if (pid >= 0)
+                    ++n_input_matched;
             }
 
             std::size_t n_selected_matched = 0, n_selected_fake = 0;
             for (const auto& pat : gpu_patterns) {
                 auto it = pattern_to_pid.find(pat);
-                long long pid = (it != pattern_to_pid.end()) ? it->second : -1LL;
+                long long pid =
+                    (it != pattern_to_pid.end()) ? it->second : -1LL;
                 if (pid >= 0)
                     ++n_selected_matched;
                 else
@@ -627,15 +631,13 @@ int main(int argc, char* argv[]) {
             }
 
             m.selection_efficiency =
-                n_input_matched > 0
-                    ? static_cast<double>(n_selected_matched) /
-                          static_cast<double>(n_input_matched)
-                    : 1.0;
-            m.fake_rate =
-                m.n_selected > 0
-                    ? static_cast<double>(n_selected_fake) /
-                          static_cast<double>(m.n_selected)
-                    : 0.0;
+                n_input_matched > 0 ? static_cast<double>(n_selected_matched) /
+                                          static_cast<double>(n_input_matched)
+                                    : 1.0;
+            m.fake_rate = m.n_selected > 0
+                              ? static_cast<double>(n_selected_fake) /
+                                    static_cast<double>(m.n_selected)
+                              : 0.0;
         }
 
         if (batch_log != nullptr) {
@@ -667,9 +669,9 @@ int main(int argc, char* argv[]) {
     // ------------------------------------------------------------------
     struct determinism_result {
         std::string label;
-        std::size_t n_runs  = 0;
-        std::size_t n_pass  = 0;
-        std::size_t n_fail  = 0;
+        std::size_t n_runs = 0;
+        std::size_t n_pass = 0;
+        std::size_t n_fail = 0;
     };
     std::vector<determinism_result> det_results;
 
@@ -687,12 +689,11 @@ int main(int argc, char* argv[]) {
             for (std::size_t r = 0; r < determinism_runs; ++r) {
                 auto det_buf = gpu_resolver(device_input);
                 stream.synchronize();
-                traccc::edm::track_container<
-                    traccc::default_algebra>::buffer det_host{
-                    copy.to(det_buf.tracks, host_mr, nullptr,
-                            vecmem::copy::type::device_to_host),
-                    {},
-                    vecmem::get_data(*meas_host_ptr)};
+                traccc::edm::track_container<traccc::default_algebra>::buffer
+                    det_host{copy.to(det_buf.tracks, host_mr, nullptr,
+                                     vecmem::copy::type::device_to_host),
+                             {},
+                             vecmem::get_data(*meas_host_ptr)};
                 stream.synchronize();
                 const std::string run_hash = compute_hash_buffer(det_host);
                 if (run_hash == reference_hash) {
@@ -707,8 +708,8 @@ int main(int argc, char* argv[]) {
             return dr;
         };
 
-        det_results.push_back(
-            check_determinism("baseline", baseline.gpu_hash, graph_algo_t::NONE));
+        det_results.push_back(check_determinism("baseline", baseline.gpu_hash,
+                                                graph_algo_t::NONE));
         if (graph_jp_run) {
             det_results.push_back(check_determinism(
                 "graph_jp", graph_jp_run->gpu_hash, graph_algo_t::JP));
@@ -737,7 +738,8 @@ int main(int argc, char* argv[]) {
                   << "\n";
         if (m.selection_efficiency >= 0.0) {
             std::cout << prefix
-                      << "selection_efficiency=" << m.selection_efficiency << "\n"
+                      << "selection_efficiency=" << m.selection_efficiency
+                      << "\n"
                       << prefix << "fake_rate=" << m.fake_rate << "\n";
         }
     };
@@ -830,8 +832,8 @@ int main(int argc, char* argv[]) {
         std::cout << "determinism_runs=" << determinism_runs << "\n";
         bool all_pass = true;
         for (const auto& dr : det_results) {
-            std::cout << "det_" << dr.label << "_pass=" << dr.n_pass
-                      << " det_" << dr.label << "_fail=" << dr.n_fail << "\n";
+            std::cout << "det_" << dr.label << "_pass=" << dr.n_pass << " det_"
+                      << dr.label << "_fail=" << dr.n_fail << "\n";
             if (dr.n_fail > 0) {
                 all_pass = false;
             }
