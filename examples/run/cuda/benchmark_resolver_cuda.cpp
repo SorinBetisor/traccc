@@ -91,7 +91,8 @@ std::string compute_hash_host(
     traccc::edm::measurement_collection::const_device meas{out.measurements};
     for (std::size_t i = 0; i < out.tracks.size(); ++i) {
         std::vector<traccc::measurement_id_type> p;
-        for (const auto& [type, idx] : out.tracks.at(i).constituent_links()) {
+        const auto track = out.tracks.at(i);
+        for (const auto& [type, idx] : track.constituent_links()) {
             if (type == traccc::edm::track_constituent_link::measurement)
                 p.push_back(meas.at(idx).identifier());
         }
@@ -120,7 +121,8 @@ std::string compute_hash_buffer(
     for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(dev.tracks.size());
          ++i) {
         std::vector<traccc::measurement_id_type> p;
-        for (const auto& [type, idx] : dev.tracks.at(i).constituent_links()) {
+        const auto track = dev.tracks.at(i);
+        for (const auto& [type, idx] : track.constituent_links()) {
             if (type == traccc::edm::track_constituent_link::measurement)
                 p.push_back(meas.at(idx).identifier());
         }
@@ -146,7 +148,8 @@ std::set<std::vector<traccc::measurement_id_type>> extract_patterns_host(
     traccc::edm::measurement_collection::const_device meas{out.measurements};
     for (std::size_t i = 0; i < out.tracks.size(); ++i) {
         std::vector<traccc::measurement_id_type> p;
-        for (const auto& [type, idx] : out.tracks.at(i).constituent_links()) {
+        const auto track = out.tracks.at(i);
+        for (const auto& [type, idx] : track.constituent_links()) {
             if (type == traccc::edm::track_constituent_link::measurement)
                 p.push_back(meas.at(idx).identifier());
         }
@@ -166,7 +169,8 @@ std::set<std::vector<traccc::measurement_id_type>> extract_patterns_buffer(
     for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(dev.tracks.size());
          ++i) {
         std::vector<traccc::measurement_id_type> p;
-        for (const auto& [type, idx] : dev.tracks.at(i).constituent_links()) {
+        const auto track = dev.tracks.at(i);
+        for (const auto& [type, idx] : track.constituent_links()) {
             if (type == traccc::edm::track_constituent_link::measurement)
                 p.push_back(meas.at(idx).identifier());
         }
@@ -598,8 +602,8 @@ int main(int argc, char* argv[]) {
                 input_tracks->measurements};
             for (std::size_t ti = 0; ti < input_tracks->tracks.size(); ++ti) {
                 std::vector<traccc::measurement_id_type> p;
-                for (const auto& [type, idx] :
-                     input_tracks->tracks.at(ti).constituent_links()) {
+                const auto track = input_tracks->tracks.at(ti);
+                for (const auto& [type, idx] : track.constituent_links()) {
                     if (type ==
                         traccc::edm::track_constituent_link::measurement)
                         p.push_back(in_meas.at(idx).identifier());

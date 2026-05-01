@@ -60,7 +60,8 @@ std::vector<std::vector<traccc::measurement_id_type>> extract_sorted_patterns(
     traccc::edm::measurement_collection::const_device meas{out.measurements};
     for (std::size_t i = 0; i < out.tracks.size(); ++i) {
         std::vector<traccc::measurement_id_type> p;
-        for (const auto& [type, idx] : out.tracks.at(i).constituent_links()) {
+        const auto track = out.tracks.at(i);
+        for (const auto& [type, idx] : track.constituent_links()) {
             if (type == traccc::edm::track_constituent_link::measurement) {
                 p.push_back(meas.at(idx).identifier());
             }
@@ -172,8 +173,9 @@ static PhaseTimingMs run_with_phase_timing(
     std::vector<std::size_t> n_meas(n_tracks, 0u);
 
     for (unsigned int i = 0; i < n_tracks; ++i) {
-        pvals[i] = input_tracks.tracks.at(i).pval();
-        const auto links = input_tracks.tracks.at(i).constituent_links();
+        const auto track = input_tracks.tracks.at(i);
+        pvals[i] = track.pval();
+        const auto links = track.constituent_links();
         const unsigned int n_cands = links.size();
         if (n_cands < config.min_meas_per_track) {
             const auto it =
