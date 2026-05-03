@@ -4,6 +4,7 @@
  */
 
 // Local include(s).
+#include "../ambiguity_tuning.hpp"
 #include "fill_keep_flags.cuh"
 
 // VecMem include(s).
@@ -11,7 +12,9 @@
 
 namespace traccc::cuda::kernels {
 
-__global__ void fill_keep_flags(device::fill_keep_flags_payload payload) {
+__global__ TRACCC_LAUNCH_BOUNDS(
+    ::traccc::cuda::tuning::graph_kernel_block_size,
+    2) void fill_keep_flags(device::fill_keep_flags_payload payload) {
 
     if (*(payload.terminate) == 1) {
         return;

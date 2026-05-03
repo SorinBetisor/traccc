@@ -4,6 +4,7 @@
  */
 
 // Local include(s).
+#include "../ambiguity_tuning.hpp"
 #include "compact_sorted_ids.cuh"
 
 // VecMem include(s).
@@ -11,7 +12,9 @@
 
 namespace traccc::cuda::kernels {
 
-__global__ void compact_sorted_ids(device::compact_sorted_ids_payload payload) {
+__global__ TRACCC_LAUNCH_BOUNDS(
+    ::traccc::cuda::tuning::graph_kernel_block_size,
+    2) void compact_sorted_ids(device::compact_sorted_ids_payload payload) {
 
     if (*(payload.terminate) == 1) {
         return;

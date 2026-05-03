@@ -8,6 +8,7 @@
 // Project include(s).
 #include "../utils/cuda_error_handling.hpp"
 #include "../utils/utils.hpp"
+#include "./ambiguity_tuning.hpp"
 #include "./kernels/add_block_offset.cuh"
 #include "./kernels/apply_graph_removals.cuh"
 #include "./kernels/block_inclusive_scan.cuh"
@@ -682,7 +683,10 @@ greedy_ambiguity_resolution_algorithm::operator()(
             // thrust calls for sort_by_key and upper_bound are stream-based
             // and the per-iteration structure changes between outer steps.
             // See docs/analysis/novelty_algs/conflict_graph_design.md.
-            const unsigned int nt_vtx = m_warp_size * 2;
+            // A1 (Tier A hardware tuning): use the wider tuned block size
+            // (256 threads = 8 warps) for the graph kernels rather than the
+            // upstream 64-thread default. See ambiguity_tuning.hpp.
+            const unsigned int nt_vtx = ::traccc::cuda::tuning::graph_kernel_block_size;
             const unsigned int nb_vtx = (n_tracks + nt_vtx - 1) / nt_vtx;
 
             // Clear per-iteration scratch. These fan-in through direct launches
@@ -708,8 +712,17 @@ greedy_ambiguity_resolution_algorithm::operator()(
             }
 
             // Build COO edge list. One block per unique measurement.
+            // A4 (Tier A hardware tuning): widen the gather block from 128
+            // to 512 threads. With 512 threads × 4 B per slot the per-block
+            // dynamic shared-memory request is 2 KB — comfortably under
+            // the default 48 KB per-block cap, so no cudaFuncSetAttribute
+            // opt-in is required (we tried 96 KB but Quadro GV100 rejects
+            // it as "invalid argument" — Volta's 96 KB-per-SM is the
+            // unified L1/shared total, not a per-block dynamic-smem max).
+            // The fast path now covers any measurement-row width
+            // realistically seen on Fatras pile-up.
             {
-                const unsigned int nt_coo = 128u;
+                const unsigned int nt_coo = ::traccc::cuda::tuning::build_conflict_coo_block_size;
                 const std::size_t smem_bytes =
                     static_cast<std::size_t>(nt_coo) * sizeof(unsigned int);
                 kernels::build_conflict_coo<<<meas_count, nt_coo, smem_bytes,
@@ -779,7 +792,11 @@ greedy_ambiguity_resolution_algorithm::operator()(
                 // JP runs a single Luby-style round per outer iteration: the
                 // resulting independent set is exactly the set of locally
                 // priority-maximal vertices (color class 0).
-                const unsigned int max_rounds = 1u;
+                // JP runs a single Luby-style round per outer iteration; MIS
+                // iterates the same propose/finalize pair up to 32 times to
+                // produce a maximal independent set.
+                const unsigned int max_rounds =
+                    (m_graph_algo == graph_algo_t::MIS) ? 32u : 1u;
                 for (unsigned int r = 0u; r < max_rounds; ++r) {
                     cudaMemsetAsync(any_undecided_device.get(), 0, sizeof(int),
                                     stream);

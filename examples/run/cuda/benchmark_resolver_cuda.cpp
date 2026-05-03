@@ -244,6 +244,7 @@ int main(int argc, char* argv[]) {
     unsigned int n_it_max = 100u;
     bool adaptive_n_it = true;
     bool run_graph_jp = false;
+    bool run_graph_mis = false;
     std::string log_graph_sizes_path;
     std::string log_graph_batches_path;
     std::size_t determinism_runs = 0;
@@ -270,6 +271,11 @@ int main(int argc, char* argv[]) {
             adaptive_n_it = false;
         } else if (arg == "--enable-jp" || arg == "--conflict-graph=jp") {
             run_graph_jp = true;
+        } else if (arg == "--conflict-graph=mis") {
+            run_graph_mis = true;
+        } else if (arg == "--conflict-graph=both") {
+            run_graph_jp = true;
+            run_graph_mis = true;
         } else if (arg.find("--log-graph-sizes=") == 0) {
             log_graph_sizes_path = arg.substr(18);
         } else if (arg.find("--log-graph-batches=") == 0) {
@@ -666,6 +672,15 @@ int main(int argc, char* argv[]) {
             run_one("graph_jp", graph_algo_t::JP, &jp_batches, &jp_sizes);
     }
 
+    // Optional Luby-style MIS conflict-graph run.
+    std::optional<run_metrics> graph_mis_run;
+    if (run_graph_mis) {
+        std::vector<unsigned int> mis_batches;
+        std::vector<std::pair<unsigned int, unsigned int>> mis_sizes;
+        graph_mis_run =
+            run_one("graph_mis", graph_algo_t::MIS, &mis_batches, &mis_sizes);
+    }
+
     // ------------------------------------------------------------------
     // Determinism check (optional, --determinism-runs=N)
     // Runs each enabled backend N additional times on the same frozen input
@@ -717,6 +732,10 @@ int main(int argc, char* argv[]) {
         if (graph_jp_run) {
             det_results.push_back(check_determinism(
                 "graph_jp", graph_jp_run->gpu_hash, graph_algo_t::JP));
+        }
+        if (graph_mis_run) {
+            det_results.push_back(check_determinism(
+                "graph_mis", graph_mis_run->gpu_hash, graph_algo_t::MIS));
         }
     }
 
@@ -812,6 +831,27 @@ int main(int argc, char* argv[]) {
             for (std::size_t i = 0; i < graph_jp_run->graph_sizes.size(); ++i) {
                 f << i << "," << graph_jp_run->graph_sizes[i].first << ","
                   << graph_jp_run->graph_sizes[i].second << "\n";
+            }
+        }
+    }
+
+    if (graph_mis_run) {
+        dump_graph_metrics(*graph_mis_run, "graph_mis_");
+        if (!log_graph_batches_path.empty()) {
+            std::ofstream f(log_graph_batches_path + ".mis.csv");
+            f << "outer_iter,batch_size\n";
+            for (std::size_t i = 0; i < graph_mis_run->batch_sizes.size();
+                 ++i) {
+                f << i << "," << graph_mis_run->batch_sizes[i] << "\n";
+            }
+        }
+        if (!log_graph_sizes_path.empty()) {
+            std::ofstream f(log_graph_sizes_path + ".mis.csv");
+            f << "outer_iter,n_vertices,n_edges\n";
+            for (std::size_t i = 0; i < graph_mis_run->graph_sizes.size();
+                 ++i) {
+                f << i << "," << graph_mis_run->graph_sizes[i].first << ","
+                  << graph_mis_run->graph_sizes[i].second << "\n";
             }
         }
     }

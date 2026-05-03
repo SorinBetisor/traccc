@@ -8,6 +8,7 @@
 #include "traccc/definitions/primitives.hpp"
 
 // Local include(s).
+#include "../ambiguity_tuning.hpp"
 #include "update_rel_shared.cuh"
 
 // VecMem include(s).
@@ -15,7 +16,11 @@
 
 namespace traccc::cuda::kernels {
 
-__global__ void update_rel_shared(device::update_rel_shared_payload payload) {
+// A2 (Tier A): occupancy hint at the tuned block size used by both the
+// graph mode and the baseline orchestrator (256 threads = 8 warps).
+__global__ TRACCC_LAUNCH_BOUNDS(
+    ::traccc::cuda::tuning::graph_kernel_block_size,
+    2) void update_rel_shared(device::update_rel_shared_payload payload) {
 
     if (*(payload.terminate) == 1) {
         return;

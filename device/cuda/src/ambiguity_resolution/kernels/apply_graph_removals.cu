@@ -8,6 +8,7 @@
 #include "traccc/definitions/primitives.hpp"
 
 // Local include(s).
+#include "../ambiguity_tuning.hpp"
 #include "apply_graph_removals.cuh"
 
 // VecMem include(s).
@@ -21,7 +22,12 @@
 
 namespace traccc::cuda::kernels {
 
-__global__ void apply_graph_removals(
+// A2 (Tier A): occupancy hint at the tuned block size (256). The kernel is
+// register-heavy because of the inner search loops; minBlocksPerSM=2 keeps
+// 50% theoretical occupancy without forcing aggressive register spilling.
+__global__ TRACCC_LAUNCH_BOUNDS(
+    ::traccc::cuda::tuning::graph_kernel_block_size,
+    2) void apply_graph_removals(
     device::apply_graph_removals_payload payload) {
 
     const unsigned int t = blockIdx.x * blockDim.x + threadIdx.x;

@@ -7,6 +7,7 @@
 #include "traccc/ambiguity_resolution/device/graph_mis_round.hpp"
 
 // Local include(s).
+#include "../ambiguity_tuning.hpp"
 #include "graph_mis_init.cuh"
 
 // VecMem include(s).
@@ -14,7 +15,10 @@
 
 namespace traccc::cuda::kernels {
 
-__global__ void graph_mis_init(device::graph_mis_init_payload payload) {
+// A2 (Tier A): give nvcc an occupancy hint matching the host-side launch.
+__global__ TRACCC_LAUNCH_BOUNDS(
+    ::traccc::cuda::tuning::graph_kernel_block_size,
+    2) void graph_mis_init(device::graph_mis_init_payload payload) {
 
     const unsigned int v = blockIdx.x * blockDim.x + threadIdx.x;
     if (v >= payload.n_vertices) {

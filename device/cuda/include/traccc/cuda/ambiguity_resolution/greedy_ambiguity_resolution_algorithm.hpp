@@ -105,7 +105,13 @@ class greedy_ambiguity_resolution_algorithm
     ///          batch removed in that iteration. JP is conflict-free by
     ///          construction: by definition, no two color-0 vertices
     ///          share an edge, so removing them in parallel is safe.
-    enum class graph_algo_t { NONE, JP };
+    ///   MIS  — Luby-style maximal independent set: same propose/finalize
+    ///          kernel pair as JP but iterated up to 32 rounds per outer
+    ///          iteration so the IN_MIS set is a true MIS (locally-worst
+    ///          vertex of every neighbourhood, not just one colour class).
+    ///          Slower per outer iteration than JP but converges in fewer
+    ///          outer iterations on dense conflict graphs.
+    enum class graph_algo_t { NONE, JP, MIS };
     void set_conflict_graph_mode(graph_algo_t a) { m_graph_algo = a; }
     graph_algo_t conflict_graph_mode() const { return m_graph_algo; }
 

@@ -4,6 +4,7 @@
  */
 
 // Local include(s).
+#include "../ambiguity_tuning.hpp"
 #include "build_conflict_coo.cuh"
 
 // VecMem include(s).
@@ -26,6 +27,11 @@ namespace traccc::cuda::kernels {
 /// directly from global memory, completely bypassing the shared-memory buffer.
 /// This ensures smem_gathered[slot] is always in bounds regardless of how many
 /// tracks share a single measurement.
+// A2: launch_bounds intentionally OMITTED here. With minBlocksPerSM=1 nvcc
+// is allowed to use up to ~128 registers/thread for a 512-thread block,
+// which on Volta produces a launch-resource error rather than a kind
+// occupancy hint. Letting nvcc choose register count keeps the kernel
+// launchable at the wider (512) block size.
 __global__ void build_conflict_coo(device::build_conflict_coo_payload payload) {
 
     const unsigned int u = blockIdx.x;
