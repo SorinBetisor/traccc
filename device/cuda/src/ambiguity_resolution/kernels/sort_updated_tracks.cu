@@ -22,8 +22,6 @@ __launch_bounds__(512) __global__
         return;
     }
 
-    __shared__ unsigned int shared_mem_tracks[512];
-
     vecmem::device_vector<const traccc::scalar> rel_shared(
         payload.rel_shared_view);
     vecmem::device_vector<const traccc::scalar> pvals(payload.pvals_view);
@@ -31,33 +29,80 @@ __launch_bounds__(512) __global__
         payload.updated_tracks_view);
 
     const unsigned int tid = threadIdx.x;
+    const unsigned int n_updated = *(payload.n_updated_tracks);
+    const unsigned int N = 1u << (32 - __clz(n_updated - 1));
 
-    // Load updated track indices into shared memory (for sorting)
-    shared_mem_tracks[tid] = std::numeric_limits<unsigned int>::max();
+    // GB-2: warp-only fast path when n_updated_tracks fits in one warp.
+    // Eliminates all __syncthreads by using __shfl_xor_sync for every
+    // compare-swap step of the bitonic network.  Only threads with
+    // tid < N participate; the rest exit early after the initial load.
+    if (N <= 32u) {
+        const unsigned int mask = (N == 32u) ? 0xFFFFFFFFu : ((1u << N) - 1u);
+        const unsigned int sentinel = std::numeric_limits<unsigned int>::max();
 
-    if (tid < *(payload.n_updated_tracks)) {
-        shared_mem_tracks[tid] = updated_tracks[tid];
+        unsigned int trk = (tid < n_updated) ? updated_tracks[tid] : sentinel;
+        traccc::scalar rel  = (trk != sentinel) ? rel_shared[trk]
+                                                 : std::numeric_limits<traccc::scalar>::max();
+        traccc::scalar pval = (trk != sentinel) ? pvals[trk] : 0.f;
+
+        for (int k = 2; k <= static_cast<int>(N); k <<= 1) {
+            for (int j = k >> 1; j > 0; j >>= 1) {
+                // Exchange key/value with partner lane.
+                unsigned int trk_p  = __shfl_xor_sync(mask, trk,  j);
+                traccc::scalar rel_p  = __shfl_xor_sync(mask, rel,  j);
+                traccc::scalar pval_p = __shfl_xor_sync(mask, pval, j);
+
+                // Partner's lane index.
+                const int ixj = static_cast<int>(tid) ^ j;
+
+                // Decide whether to keep or adopt partner's element.
+                // The segment is ascending when (tid & k) == 0.
+                const bool ascending = ((tid & k) == 0);
+                const bool lower     = (static_cast<int>(tid) < ixj);
+
+                // Comparator: current element should be the smaller one in
+                // ascending segments (lower-index position), larger in
+                // descending segments.
+                const bool cur_beats_partner =
+                    (rel < rel_p) || (rel == rel_p && pval >= pval_p);
+                const bool want_cur =
+                    ascending ? (lower ? cur_beats_partner : !cur_beats_partner)
+                              : (lower ? !cur_beats_partner : cur_beats_partner);
+
+                if (!want_cur) {
+                    trk  = trk_p;
+                    rel  = rel_p;
+                    pval = pval_p;
+                }
+            }
+        }
+
+        if (tid < n_updated) {
+            updated_tracks[tid] = trk;
+        }
+        return;
     }
 
+    // Slow path: standard shared-memory bitonic sort for n_updated > 32.
+    __shared__ unsigned int shared_mem_tracks[512];
+    shared_mem_tracks[tid] = std::numeric_limits<unsigned int>::max();
+    if (tid < n_updated) {
+        shared_mem_tracks[tid] = updated_tracks[tid];
+    }
     __syncthreads();
 
-    // Padding the number of tracks to the power of 2
-    const unsigned int N = 1 << (32 - __clz(*(payload.n_updated_tracks) - 1));
+    traccc::scalar rel_i, rel_j, pval_i, pval_j;
 
-    traccc::scalar rel_i;
-    traccc::scalar rel_j;
-    traccc::scalar pval_i;
-    traccc::scalar pval_j;
-
-    // Bitonic sort
-    for (int k = 2; k <= N; k <<= 1) {
-
-        bool ascending = ((tid & k) == 0);
+    for (int k = 2; k <= static_cast<int>(N); k <<= 1) {
+        const bool ascending = ((tid & k) == 0);
 
         for (int j = k >> 1; j > 0; j >>= 1) {
-            int ixj = tid ^ j;
+            const int ixj = static_cast<int>(tid) ^ j;
 
-            if (ixj > tid && ixj < N && tid < N) {
+            if (ixj > static_cast<int>(tid) &&
+                ixj < static_cast<int>(N) &&
+                static_cast<int>(tid) < static_cast<int>(N)) {
+
                 unsigned int trk_i = shared_mem_tracks[tid];
                 unsigned int trk_j = shared_mem_tracks[ixj];
 
@@ -82,16 +127,15 @@ __launch_bounds__(512) __global__
                     ascending;
 
                 if (should_swap) {
-                    shared_mem_tracks[tid] = trk_j;
-                    shared_mem_tracks[ixj] = trk_i;
+                    shared_mem_tracks[tid]  = trk_j;
+                    shared_mem_tracks[ixj]  = trk_i;
                 }
             }
             __syncthreads();
         }
     }
 
-    // Write back the sorted result from shared memory to global memory
-    if (tid < *(payload.n_updated_tracks)) {
+    if (tid < n_updated) {
         updated_tracks[tid] = shared_mem_tracks[tid];
     }
 }

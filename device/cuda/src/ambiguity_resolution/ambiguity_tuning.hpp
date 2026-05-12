@@ -13,11 +13,15 @@
 //
 // Greedy-only tuning tiers (this branch, remove_tracks / sort_updated_tracks
 // / rearrange_tracks only — JP/MIS kernels are NOT changed):
-//   GB-1  Warp-shuffle hybrid prefix scan in remove_tracks (replaces
-//          the Hillis-Steele shared-memory path for strides 1..16 with
-//          __shfl_up_sync, eliminating 10 __syncthreads per call).
-//   GB-2  [planned] 96 KB dynamic smem in remove_tracks, bound 512→1024.
-//   GB-3  [planned] Warp-only bitonic sort fast path in sort_updated_tracks.
+//   GB-1  Two-phase warp-shuffle prefix scan in remove_tracks: Phase 1
+//          does an intra-warp inclusive scan via __shfl_up_sync (0 syncs),
+//          Phase 2 propagates warp sums serially.  Net: 2 __syncthreads
+//          vs 18 in the original Hillis-Steele.
+//   GB-2  Warp-only bitonic sort fast path in sort_updated_tracks: when
+//          n_updated_tracks ≤ 32 the entire sort runs via __shfl_xor_sync
+//          (zero __syncthreads, all in registers), eliminating shared-mem
+//          traffic for the common convergence-phase invocations.
+//   GB-3  [planned] 96 KB dynamic smem in remove_tracks, bound 512→1024.
 
 #pragma once
 
