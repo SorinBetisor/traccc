@@ -325,19 +325,62 @@ __launch_bounds__(512) __global__
 
     __syncthreads();
 
-    // Exclusive scan (Hillis-Steele)
+    // Inclusive prefix scan — two-phase warp-shuffle approach.
+    //
+    // GB-1 optimisation: replace the Hillis-Steele shared-memory scan
+    // (18 __syncthreads for a 512-element array) with a two-phase design:
+    //   Phase 1: each warp does an intra-warp inclusive scan using
+    //            __shfl_up_sync (zero __syncthreads, purely register-based).
+    //   Phase 2: thread 0 propagates the per-warp totals serially (≤16 ops),
+    //            then each thread adds its warp's prefix offset.
+    // Total cost: 2 __syncthreads + 1 serial pass over ≤16 warp sums,
+    // vs 18 __syncthreads in the original.
+    //
+    // Correctness note: all 512 threads participate so threads with
+    // is_valid=0 contribute a zero to the sum, which is harmless.
+    {
+        const int warp_id = static_cast<int>(threadIndex) / 32;
+        const int lane_id = static_cast<int>(threadIndex) & 31;
 
-    // Buffer for the prefix
-    sh_buffer[threadIndex] = is_valid;  // copy input
-    __syncthreads();
+        // Phase 1: intra-warp inclusive scan (register-only, no sync).
+        const unsigned int full_mask = 0xFFFFFFFFu;
+        int scan_val = is_valid;
+        for (int offset = 1; offset < 32; offset <<= 1) {
+            int contrib = __shfl_up_sync(full_mask, scan_val, offset);
+            if (lane_id >= offset) {
+                scan_val += contrib;
+            }
+        }
 
-    for (int offset = 1; offset < *(payload.n_meas_to_remove); offset <<= 1) {
-        int val = 0;
-        if (threadIndex >= offset) {
-            val = sh_buffer[threadIndex - offset];
+        // Collect each warp's total (the last lane's inclusive sum).
+        // sh_buffer is 512 ints; we temporarily borrow the last 16 slots for
+        // warp sums (indices 496..511 are never valid scan outputs because
+        // n_valid_threads ≤ blockDim.x - 16 in practice).
+        __shared__ int sh_warp_sums[16];  // 16 warps × 4 B = 64 B
+        if (lane_id == 31) {
+            sh_warp_sums[warp_id] = scan_val;
         }
         __syncthreads();
-        sh_buffer[threadIndex] += val;
+
+        // Phase 2: thread 0 builds an exclusive warp-prefix array (serial,
+        // ≤ 16 additions).
+        if (threadIndex == 0) {
+            int running = 0;
+            const int n_warps = static_cast<int>(blockDim.x) / 32;
+            for (int w = 0; w < n_warps; ++w) {
+                int wt = sh_warp_sums[w];
+                sh_warp_sums[w] = running;  // exclusive prefix
+                running += wt;
+            }
+        }
+        __syncthreads();
+
+        // Phase 3: each thread adds its warp's exclusive prefix.
+        if (warp_id > 0) {
+            scan_val += sh_warp_sums[warp_id];
+        }
+
+        sh_buffer[threadIndex] = scan_val;
         __syncthreads();
     }
 

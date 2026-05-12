@@ -1,16 +1,23 @@
-// TRACCC ambiguity-resolver Tier A hardware tuning constants.
+// TRACCC ambiguity-resolver hardware tuning constants.
 //
 // Single-header tuning lever for the GV100 (Volta, SM 7.0) target.
-// All values are static so there is no runtime dispatch overhead; switching
-// the untuned vs tuned binary is done by checking out a different branch
-// (thesis-novelty-conflict-graph vs thesis-novelty-hardware-tuning).
+// Branch: thesis-greedy-hardware-tuning
+//   (forked from thesis-novelty-hardware-tuning, greedy-only scope)
 //
-// Tier A items applied here:
-//   A1  Larger block size for graph kernels (was warp_size*2 = 64).
+// Inherited Tier A items (all three backends):
+//   A1  Block size for graph kernels — reverted to 64 (ablated).
 //   A2  __launch_bounds__ macros for nvcc occupancy hints.
 //   A3  Read-only-cache hint helpers (__ldg) + restrict pointer macros.
-//   A4  96 KB shared memory opt-in for build_conflict_coo + larger nt_coo.
+//   A4  96 KB shared memory opt-in for build_conflict_coo + wider nt_coo.
 //   A5  thrust::cuda::par_nosync policy (applied at call sites).
+//
+// Greedy-only tuning tiers (this branch, remove_tracks / sort_updated_tracks
+// / rearrange_tracks only — JP/MIS kernels are NOT changed):
+//   GB-1  Warp-shuffle hybrid prefix scan in remove_tracks (replaces
+//          the Hillis-Steele shared-memory path for strides 1..16 with
+//          __shfl_up_sync, eliminating 10 __syncthreads per call).
+//   GB-2  [planned] 96 KB dynamic smem in remove_tracks, bound 512→1024.
+//   GB-3  [planned] Warp-only bitonic sort fast path in sort_updated_tracks.
 
 #pragma once
 
@@ -20,11 +27,10 @@ namespace traccc::cuda::tuning {
 
 // ---- A1: graph kernel launch geometry ------------------------------------
 // All graph_mis_* kernels and apply_graph_removals/update_rel_shared use a
-// 1D grid with this block size. 64 (warp_size*2) was the upstream default;
-// 256 = 8 warps gives a much better instructions-per-block ratio on Volta
-// while still allowing 8 resident blocks per SM (= full 64-warp occupancy
-// at typical register usage).
-inline constexpr unsigned int graph_kernel_block_size = 256u;
+// 1D grid with this block size.
+// A1 ABLATION: reverted to 64 (warp_size*2, the upstream default) to test
+// whether 256 was causing the high-pile-up regression seen in sweep 1.
+inline constexpr unsigned int graph_kernel_block_size = 64u;
 
 // ---- A4: build_conflict_coo launch geometry ------------------------------
 // nt_coo is the per-CTA gather width for the COO-edge-list builder. The
