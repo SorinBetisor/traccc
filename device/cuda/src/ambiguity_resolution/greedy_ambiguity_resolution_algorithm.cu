@@ -47,6 +47,9 @@
 #define AR_NVTX_POP() ((void)0)
 #endif
 
+// System include(s).
+#include <vector>
+
 // Thrust include(s).
 #include <thrust/binary_search.h>
 #include <thrust/execution_policy.h>
@@ -96,6 +99,46 @@ struct PerfEvents {
         return ms;
     }
 };
+
+struct eviction_launch_config {
+    unsigned int nThreads_adaptive{0u};
+    unsigned int nBlocks_adaptive{0u};
+    unsigned int nThreads_rearrange{0u};
+    unsigned int nBlocks_rearrange{0u};
+    unsigned int nThreads_scan{0u};
+    unsigned int nBlocks_scan{0u};
+};
+
+struct eviction_graph_nodes {
+    cudaGraphNode_t fill_inverted_ids{nullptr};
+    cudaGraphNode_t block_inclusive_scan{nullptr};
+    cudaGraphNode_t scan_block_offsets{nullptr};
+    cudaGraphNode_t add_block_offset{nullptr};
+    cudaGraphNode_t rearrange_tracks{nullptr};
+    cudaGraphNode_t update_status{nullptr};
+};
+
+struct graph_exec_holder {
+    cudaGraph_t graph{nullptr};
+    cudaGraphExec_t exec{nullptr};
+
+    ~graph_exec_holder() {
+        if (exec != nullptr) cudaGraphExecDestroy(exec);
+        if (graph != nullptr) cudaGraphDestroy(graph);
+    }
+};
+
+void set_kernel_node_launch(cudaGraphExec_t graph_exec, cudaGraphNode_t node,
+                            dim3 grid, dim3 block,
+                            std::size_t shared_mem_bytes = 0u) {
+    cudaKernelNodeParams params{};
+    TRACCC_CUDA_ERROR_CHECK(cudaGraphKernelNodeGetParams(node, &params));
+    params.gridDim = grid;
+    params.blockDim = block;
+    params.sharedMemBytes = static_cast<unsigned int>(shared_mem_bytes);
+    TRACCC_CUDA_ERROR_CHECK(
+        cudaGraphExecKernelNodeSetParams(graph_exec, node, &params));
+}
 
 }  // namespace
 
@@ -673,7 +716,21 @@ greedy_ambiguity_resolution_algorithm::operator()(
         graph_sizes_this_call.reserve(256);
     }
 
+    float gk_remove_ms = 0.f;
+    float gk_sort_ms = 0.f;
+    float gk_fill_inv_ms = 0.f;
+    float gk_block_scan_ms = 0.f;
+    float gk_scan_bo_ms = 0.f;
+    float gk_add_bo_ms = 0.f;
+    float gk_rearr_ms = 0.f;
+    float gk_upd_ms = 0.f;
+
     AR_NVTX_PUSH("gpu_ar_eviction_loop");
+    unsigned int n_graph_instantiations = 0u;
+    graph_exec_holder reused_graph{};
+    eviction_graph_nodes reused_nodes{};
+    bool reused_graph_ready = false;
+
     // Start the iteration
     while (!terminate && n_accepted > 0) {
         nBlocks_adaptive =
@@ -978,11 +1035,213 @@ greedy_ambiguity_resolution_algorithm::operator()(
             continue;
         }
 
-        // Make a CUDA Graph. We use CUDA graph to minimize the overheads from
-        // kernel launches
-        cudaGraph_t graph;
-        cudaGraphExec_t graphExec;
+        const bool eager_greedy_kernel_prof =
+            m_profiling && m_greedy_kernel_breakdown && !m_parallel_batch &&
+            (m_graph_algo == graph_algo_t::NONE);
 
+        if (eager_greedy_kernel_prof) {
+            const unsigned int n_it =
+                m_adaptive_n_it
+                    ? (n_accepted < 500u
+                           ? std::max(10u, std::min(50u, n_accepted / 5u))
+                           : m_n_it_max)
+                    : m_n_it_max;
+
+            cudaEvent_t gk_ev[9];
+            for (int gi = 0; gi < 9; ++gi) {
+                cudaEventCreate(&gk_ev[gi]);
+            }
+            float* gk_acc[8] = {
+                &gk_remove_ms,    &gk_sort_ms,      &gk_fill_inv_ms,
+                &gk_block_scan_ms, &gk_scan_bo_ms, &gk_add_bo_ms,
+                &gk_rearr_ms,     &gk_upd_ms};
+
+            for (unsigned int iter = 0; iter < n_it; ++iter) {
+                cudaEventRecord(gk_ev[0], stream);
+
+                kernels::remove_tracks<<<1, 512, 0, stream>>>(
+                    device::remove_tracks_payload{
+                        .sorted_ids_view = sorted_ids_buffer,
+                        .n_accepted = n_accepted_device.get(),
+                        .meas_ids_view = meas_ids_buffer,
+                        .n_meas_view = n_meas_buffer,
+                        .meas_id_to_unique_id_view =
+                            meas_id_to_unique_id_buffer,
+                        .tracks_per_measurement_view =
+                            tracks_per_measurement_buffer,
+                        .track_status_per_measurement_view =
+                            track_status_per_measurement_buffer,
+                        .n_accepted_tracks_per_measurement_view =
+                            n_accepted_tracks_per_measurement_buffer,
+                        .n_shared_view = n_shared_buffer,
+                        .rel_shared_view = rel_shared_buffer,
+                        .n_removable_tracks = n_removable_tracks_device.get(),
+                        .n_meas_to_remove = n_meas_to_remove_device.get(),
+                        .terminate = terminate_device.get(),
+                        .max_shared = max_shared_device.get(),
+                        .n_updated_tracks = n_updated_tracks_device.get(),
+                        .updated_tracks_view = updated_tracks_buffer,
+                        .is_updated_view = is_updated_buffer,
+                        .n_valid_threads = n_valid_threads_device.get(),
+                        .track_count_view = track_count_buffer});
+
+                cudaEventRecord(gk_ev[1], stream);
+
+                kernels::sort_updated_tracks<<<1, 512, 0, stream>>>(
+                    device::sort_updated_tracks_payload{
+                        .rel_shared_view = rel_shared_buffer,
+                        .pvals_view = pvals_buffer,
+                        .terminate = terminate_device.get(),
+                        .n_updated_tracks = n_updated_tracks_device.get(),
+                        .updated_tracks_view = updated_tracks_buffer,
+                    });
+
+                cudaEventRecord(gk_ev[2], stream);
+
+                kernels::fill_inverted_ids<<<nBlocks_adaptive, nThreads_adaptive,
+                                             0, stream>>>(
+                    device::fill_inverted_ids_payload{
+                        .sorted_ids_view = sorted_ids_buffer,
+                        .terminate = terminate_device.get(),
+                        .n_accepted = n_accepted_device.get(),
+                        .n_updated_tracks = n_updated_tracks_device.get(),
+                        .inverted_ids_view = inverted_ids_buffer,
+                    });
+
+                cudaEventRecord(gk_ev[3], stream);
+
+                kernels::block_inclusive_scan<<<nBlocks_scan, nThreads_scan,
+                                                nThreads_scan * sizeof(int),
+                                                stream>>>(
+                    device::block_inclusive_scan_payload{
+                        .sorted_ids_view = sorted_ids_buffer,
+                        .terminate = terminate_device.get(),
+                        .n_accepted = n_accepted_device.get(),
+                        .n_updated_tracks = n_updated_tracks_device.get(),
+                        .is_updated_view = is_updated_buffer,
+                        .block_offsets_view = block_offsets_buffer,
+                        .prefix_sums_view = prefix_sums_buffer});
+
+                cudaEventRecord(gk_ev[4], stream);
+
+                kernels::scan_block_offsets<<<1, nBlocks_scan,
+                                              nBlocks_scan * sizeof(int),
+                                              stream>>>(
+                    device::scan_block_offsets_payload{
+                        .terminate = terminate_device.get(),
+                        .n_accepted = n_accepted_device.get(),
+                        .n_updated_tracks = n_updated_tracks_device.get(),
+                        .block_offsets_view = block_offsets_buffer,
+                        .scanned_block_offsets_view =
+                            scanned_block_offsets_buffer});
+
+                cudaEventRecord(gk_ev[5], stream);
+
+                kernels::add_block_offset<<<nBlocks_scan, nThreads_scan, 0,
+                                            stream>>>(
+                    device::add_block_offset_payload{
+                        .terminate = terminate_device.get(),
+                        .n_accepted = n_accepted_device.get(),
+                        .n_updated_tracks = n_updated_tracks_device.get(),
+                        .block_offsets_view = scanned_block_offsets_buffer,
+                        .prefix_sums_view = prefix_sums_buffer});
+
+                cudaEventRecord(gk_ev[6], stream);
+
+                kernels::rearrange_tracks<<<nBlocks_rearrange,
+                                            nThreads_rearrange, 0, stream>>>(
+                    device::rearrange_tracks_payload{
+                        .sorted_ids_view = sorted_ids_buffer,
+                        .inverted_ids_view = inverted_ids_buffer,
+                        .rel_shared_view = rel_shared_buffer,
+                        .pvals_view = pvals_buffer,
+                        .terminate = terminate_device.get(),
+                        .n_accepted = n_accepted_device.get(),
+                        .n_updated_tracks = n_updated_tracks_device.get(),
+                        .updated_tracks_view = updated_tracks_buffer,
+                        .is_updated_view = is_updated_buffer,
+                        .prefix_sums_view = prefix_sums_buffer,
+                        .temp_sorted_ids_view = temp_sorted_ids_buffer,
+                    });
+
+                cudaEventRecord(gk_ev[7], stream);
+
+                kernels::
+                    update_status<<<nBlocks_adaptive, nThreads_adaptive, 0,
+                                    stream>>>(
+                        device::update_status_payload{
+                            .terminate = terminate_device.get(),
+                            .n_accepted = n_accepted_device.get(),
+                            .n_updated_tracks = n_updated_tracks_device.get(),
+                            .temp_sorted_ids_view = temp_sorted_ids_buffer,
+                            .sorted_ids_view = sorted_ids_buffer,
+                            .updated_tracks_view = updated_tracks_buffer,
+                            .is_updated_view = is_updated_buffer,
+                            .n_shared_view = n_shared_buffer,
+                            .max_shared = max_shared_device.get()});
+
+                cudaEventRecord(gk_ev[8], stream);
+
+                m_stream.get().synchronize();
+                for (int s = 0; s < 8; ++s) {
+                    float ms = 0.f;
+                    cudaEventElapsedTime(&ms, gk_ev[s], gk_ev[s + 1]);
+                    *gk_acc[s] += ms;
+                }
+            }
+            for (int gi = 0; gi < 9; ++gi) {
+                cudaEventDestroy(gk_ev[gi]);
+            }
+
+            n_graph_launches += n_it;
+        } else {
+        // CUDA Graph path (baseline greedy or PBG captured).
+        // When m_reuse_eviction_graph is enabled for the greedy baseline path,
+        // the graph is captured once and its kernel-node launch dims updated
+        // via cudaGraphExecKernelNodeSetParams on subsequent outer iterations,
+        // eliminating the per-iteration cudaGraphInstantiate overhead.
+        const bool do_reuse = m_reuse_eviction_graph && !m_parallel_batch;
+
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t graphExec = nullptr;
+
+        if (do_reuse && reused_graph_ready) {
+            // Update launch parameters only — no re-capture needed.
+            const eviction_launch_config elc{
+                .nThreads_adaptive = nThreads_adaptive,
+                .nBlocks_adaptive  = nBlocks_adaptive,
+                .nThreads_rearrange = nThreads_rearrange,
+                .nBlocks_rearrange  = nBlocks_rearrange,
+                .nThreads_scan     = nThreads_scan,
+                .nBlocks_scan      = nBlocks_scan,
+            };
+            set_kernel_node_launch(reused_graph.exec,
+                                   reused_nodes.fill_inverted_ids,
+                                   dim3(elc.nBlocks_adaptive),
+                                   dim3(elc.nThreads_adaptive));
+            set_kernel_node_launch(reused_graph.exec,
+                                   reused_nodes.block_inclusive_scan,
+                                   dim3(elc.nBlocks_scan),
+                                   dim3(elc.nThreads_scan),
+                                   elc.nThreads_scan * sizeof(int));
+            set_kernel_node_launch(reused_graph.exec,
+                                   reused_nodes.scan_block_offsets,
+                                   dim3(1u), dim3(elc.nBlocks_scan),
+                                   elc.nBlocks_scan * sizeof(int));
+            set_kernel_node_launch(reused_graph.exec,
+                                   reused_nodes.add_block_offset,
+                                   dim3(elc.nBlocks_scan),
+                                   dim3(elc.nThreads_scan));
+            set_kernel_node_launch(reused_graph.exec,
+                                   reused_nodes.rearrange_tracks,
+                                   dim3(elc.nBlocks_rearrange),
+                                   dim3(elc.nThreads_rearrange));
+            set_kernel_node_launch(reused_graph.exec,
+                                   reused_nodes.update_status,
+                                   dim3(elc.nBlocks_adaptive),
+                                   dim3(elc.nThreads_adaptive));
+            graphExec = reused_graph.exec;
+        } else {
         cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
 
         if (!m_parallel_batch) {
@@ -1242,7 +1501,42 @@ greedy_ambiguity_resolution_algorithm::operator()(
                     .max_shared = max_shared_device.get()});
 
         cudaStreamEndCapture(stream, &graph);
-        cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0);
+        cudaGraphExec_t new_exec = nullptr;
+        cudaGraphInstantiate(&new_exec, graph, nullptr, nullptr, 0);
+        ++n_graph_instantiations;
+
+        if (do_reuse && !reused_graph_ready) {
+            // First capture: save graph + exec for reuse. Collect node handles.
+            reused_graph.graph = graph;
+            reused_graph.exec  = new_exec;
+
+            // Collect the 8 kernel nodes in the captured greedy chain.
+            std::size_t num_nodes = 0u;
+            cudaGraphGetNodes(graph, nullptr, &num_nodes);
+            std::vector<cudaGraphNode_t> nodes(num_nodes);
+            cudaGraphGetNodes(graph, nodes.data(), &num_nodes);
+            // Node order follows capture order: remove_tracks(0),
+            // sort_updated_tracks(1), fill_inverted_ids(2),
+            // block_inclusive_scan(3), scan_block_offsets(4),
+            // add_block_offset(5), rearrange_tracks(6), update_status(7).
+            if (num_nodes >= 8u) {
+                reused_nodes = eviction_graph_nodes{
+                    .fill_inverted_ids  = nodes[2],
+                    .block_inclusive_scan = nodes[3],
+                    .scan_block_offsets = nodes[4],
+                    .add_block_offset   = nodes[5],
+                    .rearrange_tracks   = nodes[6],
+                    .update_status      = nodes[7],
+                };
+            }
+            reused_graph_ready = true;
+            graphExec = new_exec;
+        } else if (!do_reuse) {
+            // Non-reuse path: use a temporary exec, destroy after this step.
+            graphExec = new_exec;
+        }
+        // Close the else block opened for "!reused_graph_ready" capture
+        }  // end capture-or-update branch
 
         // Adaptive formula minimises CUDA Graph construction overhead.
         // Benchmark data shows graph construction (not launch count) dominates
@@ -1258,6 +1552,13 @@ greedy_ambiguity_resolution_algorithm::operator()(
             cudaGraphLaunch(graphExec, stream);
         }
         n_graph_launches += n_it;
+
+        // For the non-reuse path, destroy the per-iteration graph/exec.
+        if (!do_reuse && graphExec != nullptr) {
+            cudaGraphExecDestroy(graphExec);
+            cudaGraphDestroy(graph);
+        }
+        }  // end outer graph-path else
 
         cudaMemcpyAsync(&terminate, terminate_device.get(), sizeof(int),
                         cudaMemcpyDeviceToHost, stream);
@@ -1343,6 +1644,15 @@ greedy_ambiguity_resolution_algorithm::operator()(
         m_last_profile.eviction_loop_ms = perf.elapsed(5, 6);
         m_last_profile.output_copy_ms = perf.elapsed(6, 7);
         m_last_profile.eviction_graph_launches = n_graph_launches;
+        m_last_profile.eviction_graph_instantiations = n_graph_instantiations;
+        m_last_profile.greedy_remove_tracks_ms = gk_remove_ms;
+        m_last_profile.greedy_sort_updated_tracks_ms = gk_sort_ms;
+        m_last_profile.greedy_fill_inverted_ids_ms = gk_fill_inv_ms;
+        m_last_profile.greedy_block_inclusive_scan_ms = gk_block_scan_ms;
+        m_last_profile.greedy_scan_block_offsets_ms = gk_scan_bo_ms;
+        m_last_profile.greedy_add_block_offset_ms = gk_add_bo_ms;
+        m_last_profile.greedy_rearrange_tracks_ms = gk_rearr_ms;
+        m_last_profile.greedy_update_status_ms = gk_upd_ms;
     }
 
     return res_track_candidates_buffer;

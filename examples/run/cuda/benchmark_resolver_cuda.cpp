@@ -91,7 +91,8 @@ std::string compute_hash_host(
     traccc::edm::measurement_collection::const_device meas{out.measurements};
     for (std::size_t i = 0; i < out.tracks.size(); ++i) {
         std::vector<traccc::measurement_id_type> p;
-        for (const auto& [type, idx] : out.tracks.at(i).constituent_links()) {
+        const auto track = out.tracks.at(i);
+        for (const auto& [type, idx] : track.constituent_links()) {
             if (type == traccc::edm::track_constituent_link::measurement)
                 p.push_back(meas.at(idx).identifier());
         }
@@ -120,7 +121,8 @@ std::string compute_hash_buffer(
     for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(dev.tracks.size());
          ++i) {
         std::vector<traccc::measurement_id_type> p;
-        for (const auto& [type, idx] : dev.tracks.at(i).constituent_links()) {
+        const auto track = dev.tracks.at(i);
+        for (const auto& [type, idx] : track.constituent_links()) {
             if (type == traccc::edm::track_constituent_link::measurement)
                 p.push_back(meas.at(idx).identifier());
         }
@@ -146,7 +148,8 @@ std::set<std::vector<traccc::measurement_id_type>> extract_patterns_host(
     traccc::edm::measurement_collection::const_device meas{out.measurements};
     for (std::size_t i = 0; i < out.tracks.size(); ++i) {
         std::vector<traccc::measurement_id_type> p;
-        for (const auto& [type, idx] : out.tracks.at(i).constituent_links()) {
+        const auto track = out.tracks.at(i);
+        for (const auto& [type, idx] : track.constituent_links()) {
             if (type == traccc::edm::track_constituent_link::measurement)
                 p.push_back(meas.at(idx).identifier());
         }
@@ -166,7 +169,8 @@ std::set<std::vector<traccc::measurement_id_type>> extract_patterns_buffer(
     for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(dev.tracks.size());
          ++i) {
         std::vector<traccc::measurement_id_type> p;
-        for (const auto& [type, idx] : dev.tracks.at(i).constituent_links()) {
+        const auto track = dev.tracks.at(i);
+        for (const auto& [type, idx] : track.constituent_links()) {
             if (type == traccc::edm::track_constituent_link::measurement)
                 p.push_back(meas.at(idx).identifier());
         }
@@ -192,6 +196,43 @@ double track_selection_overlap(
         }
     }
     return static_cast<double>(inter) / static_cast<double>(cpu.size());
+}
+
+struct selection_comparison {
+    std::size_t intersection_count = 0;
+    std::size_t union_count = 0;
+    std::size_t cpu_only_count = 0;
+    std::size_t gpu_only_count = 0;
+    double jaccard = 1.0;
+    long long n_selected_delta = 0;
+};
+
+selection_comparison compare_selections(
+    const std::set<std::vector<traccc::measurement_id_type>>& gpu,
+    const std::set<std::vector<traccc::measurement_id_type>>& cpu) {
+
+    selection_comparison cmp;
+    for (const auto& p : gpu) {
+        if (cpu.count(p) > 0) {
+            ++cmp.intersection_count;
+        } else {
+            ++cmp.gpu_only_count;
+        }
+    }
+    for (const auto& p : cpu) {
+        if (gpu.count(p) == 0) {
+            ++cmp.cpu_only_count;
+        }
+    }
+
+    cmp.union_count = gpu.size() + cpu.size() - cmp.intersection_count;
+    cmp.jaccard = cmp.union_count > 0
+                      ? static_cast<double>(cmp.intersection_count) /
+                            static_cast<double>(cmp.union_count)
+                      : 1.0;
+    cmp.n_selected_delta = static_cast<long long>(gpu.size()) -
+                           static_cast<long long>(cpu.size());
+    return cmp;
 }
 
 /// Post-resolve duplicate rate = (# measurement slots that are shared by >= 2
@@ -237,11 +278,13 @@ int main(int argc, char* argv[]) {
     std::size_t repeats = 10;
     std::size_t warmup = 3;
     bool profile_mode = false;
+    bool profile_kernels = false;
     unsigned int n_it_max = 100u;
     bool adaptive_n_it = true;
     bool parallel_batch = false;
     unsigned int parallel_batch_window = 8192u;
     std::string log_batch_sizes_path;
+    bool reuse_eviction_graph = false;
     bool run_graph_mis = false;
     bool run_graph_jp = false;
     std::string log_graph_sizes_path;
@@ -265,6 +308,8 @@ int main(int argc, char* argv[]) {
             warmup = std::stoull(arg.substr(9));
         else if (arg == "--profile")
             profile_mode = true;
+        else if (arg == "--profile-kernels")
+            profile_kernels = true;
         else if (arg.find("--n-it=") == 0) {
             n_it_max = static_cast<unsigned int>(std::stoull(arg.substr(7)));
             adaptive_n_it = false;
@@ -294,6 +339,8 @@ int main(int argc, char* argv[]) {
             log_graph_sizes_path = arg.substr(18);
         } else if (arg.find("--log-graph-batches=") == 0) {
             log_graph_batches_path = arg.substr(20);
+        } else if (arg == "--reuse-eviction-graph") {
+            reuse_eviction_graph = true;
         } else if (arg.find("--determinism-runs=") == 0) {
             determinism_runs = std::stoull(arg.substr(19));
         } else if (arg.find("--truth-file=") == 0) {
@@ -313,6 +360,9 @@ int main(int argc, char* argv[]) {
                    "to N (disables adaptive)\n"
                 << "  --profile             Run one extra call with per-phase "
                    "CUDA event timing\n"
+                << "  --profile-kernels     With --profile, also accumulate "
+                   "per-kernel times on an eager baseline-greedy path (no CUDA "
+                   "graph)\n"
                 << "  --parallel-batch      Also run the Tier 2a parallel "
                    "batch greedy path\n"
                 << "  --parallel-batch-window=N   Candidate window size for "
@@ -325,6 +375,9 @@ int main(int argc, char* argv[]) {
                    "batch sizes\n"
                 << "  --log-graph-sizes=<path.csv>  Write Tier 2c per-iter "
                    "|V|,|E|\n"
+                << "  --reuse-eviction-graph  Capture the greedy eviction CUDA "
+                   "graph once and reuse it with kernel-node param updates "
+                   "(baseline greedy path only; no PBG/conflict-graph)\n"
                 << "  --determinism-runs=N  Run each enabled GPU backend N "
                    "extra times and assert selection-identical output on every "
                    "run (validates determinism; default 0 = disabled)\n"
@@ -350,6 +403,10 @@ int main(int argc, char* argv[]) {
                    "hash_match\n";
             return 0;
         }
+    }
+
+    if (profile_kernels) {
+        profile_mode = true;
     }
 
     // ------------------------------------------------------------------
@@ -454,6 +511,7 @@ int main(int argc, char* argv[]) {
         config, mr, copy, stream);
     gpu_resolver.set_n_it_max(n_it_max);
     gpu_resolver.set_adaptive_n_it(adaptive_n_it);
+    gpu_resolver.set_reuse_eviction_graph(reuse_eviction_graph);
 
     // CPU reference patterns for overlap computation.
     const auto cpu_patterns = extract_patterns_host(cpu_result);
@@ -525,6 +583,12 @@ int main(int argc, char* argv[]) {
         std::string gpu_hash;
         bool hash_match = false;
         double track_overlap_vs_cpu = 0.0;
+        std::size_t selected_intersection_count = 0;
+        std::size_t selected_union_count = 0;
+        double selected_jaccard = 1.0;
+        std::size_t cpu_only_selected_count = 0;
+        std::size_t gpu_only_selected_count = 0;
+        long long n_selected_delta = 0;
         double duplicate_rate_post = 0.0;
         // Truth-based metrics (populated only when --truth-file is provided).
         double selection_efficiency = -1.0;  // |selected matched| / |all matched|
@@ -620,6 +684,13 @@ int main(int argc, char* argv[]) {
         auto gpu_patterns = extract_patterns_buffer(result_host_buf);
         m.track_overlap_vs_cpu =
             track_selection_overlap(gpu_patterns, cpu_patterns);
+        const auto cmp = compare_selections(gpu_patterns, cpu_patterns);
+        m.selected_intersection_count = cmp.intersection_count;
+        m.selected_union_count = cmp.union_count;
+        m.selected_jaccard = cmp.jaccard;
+        m.cpu_only_selected_count = cmp.cpu_only_count;
+        m.gpu_only_selected_count = cmp.gpu_only_count;
+        m.n_selected_delta = cmp.n_selected_delta;
         m.duplicate_rate_post = duplicate_rate(gpu_patterns);
 
         // Truth-based metrics: requires truth_particle_ids to be populated.
@@ -633,8 +704,8 @@ int main(int argc, char* argv[]) {
                 input_tracks->measurements};
             for (std::size_t ti = 0; ti < input_tracks->tracks.size(); ++ti) {
                 std::vector<traccc::measurement_id_type> p;
-                for (const auto& [type, idx] :
-                     input_tracks->tracks.at(ti).constituent_links()) {
+                const auto track = input_tracks->tracks.at(ti);
+                for (const auto& [type, idx] : track.constituent_links()) {
                     if (type == traccc::edm::track_constituent_link::measurement)
                         p.push_back(in_meas.at(idx).identifier());
                 }
@@ -793,13 +864,26 @@ int main(int argc, char* argv[]) {
                   << " time_ms_std=" << m.std_ms
                   << " time_ms_median=" << m.median_ms
                   << " time_ms_p95=" << m.p95_ms << "\n"
+                  << prefix << "latency_ms_per_event=" << m.mean_ms << "\n"
                   << prefix << "events_per_sec=" << (1000.0 / m.mean_ms) << "\n"
+                  << prefix << "single_event_equiv_events_per_sec="
+                  << (1000.0 / m.mean_ms) << "\n"
                   << prefix << "time_d2h_ms=" << m.d2h_ms << "\n"
                   << prefix << "output_hash=" << m.gpu_hash << "\n"
                   << prefix
                   << "hash_match=" << (m.hash_match ? "true" : "false") << "\n"
                   << prefix << "track_overlap_vs_cpu=" << m.track_overlap_vs_cpu
                   << "\n"
+                  << prefix << "selected_intersection_count="
+                  << m.selected_intersection_count << "\n"
+                  << prefix << "selected_union_count=" << m.selected_union_count
+                  << "\n"
+                  << prefix << "selected_jaccard=" << m.selected_jaccard << "\n"
+                  << prefix << "cpu_only_selected_count="
+                  << m.cpu_only_selected_count << "\n"
+                  << prefix << "gpu_only_selected_count="
+                  << m.gpu_only_selected_count << "\n"
+                  << prefix << "n_selected_delta=" << m.n_selected_delta << "\n"
                   << prefix << "duplicate_rate_post=" << m.duplicate_rate_post
                   << "\n";
         if (m.selection_efficiency >= 0.0) {
@@ -812,6 +896,8 @@ int main(int argc, char* argv[]) {
     std::cout << "backend=gpu\n"
               << "n_it_max=" << n_it_max << "\n"
               << "adaptive_n_it=" << (adaptive_n_it ? "true" : "false") << "\n"
+              << "reuse_eviction_graph="
+              << (reuse_eviction_graph ? "true" : "false") << "\n"
               << "parallel_batch_enabled="
               << (parallel_batch ? "true" : "false") << "\n"
               << "parallel_batch_window=" << parallel_batch_window << "\n"
@@ -972,13 +1058,20 @@ int main(int argc, char* argv[]) {
     // below still compiles.
     const bool hash_match = baseline.hash_match;
     const std::string gpu_hash = baseline.gpu_hash;
-    (void)hash_match;
     (void)gpu_hash;
 
     if (profile_mode) {
+        gpu_resolver.set_conflict_graph_mode(
+            traccc::cuda::greedy_ambiguity_resolution_algorithm::graph_algo_t::
+                NONE);
+        gpu_resolver.set_parallel_batch_mode(false);
         gpu_resolver.set_profiling(true);
+        if (profile_kernels) {
+            gpu_resolver.set_greedy_kernel_breakdown(true);
+        }
         gpu_resolver(device_input);
         stream.synchronize();
+        gpu_resolver.set_greedy_kernel_breakdown(false);
         gpu_resolver.set_profiling(false);
 
         const traccc::cuda::gpu_profile_data_t& pd =
@@ -993,8 +1086,26 @@ int main(int argc, char* argv[]) {
                   << "profile_output_copy_ms=" << pd.output_copy_ms << "\n"
                   << "profile_eviction_graph_launches="
                   << pd.eviction_graph_launches << "\n"
+                  << "profile_eviction_graph_instantiations="
+                  << pd.eviction_graph_instantiations << "\n"
                   << "profile_unique_meas_count=" << pd.unique_meas_count
                   << "\n"
+                  << "profile_greedy_remove_tracks_ms="
+                  << pd.greedy_remove_tracks_ms << "\n"
+                  << "profile_greedy_sort_updated_tracks_ms="
+                  << pd.greedy_sort_updated_tracks_ms << "\n"
+                  << "profile_greedy_fill_inverted_ids_ms="
+                  << pd.greedy_fill_inverted_ids_ms << "\n"
+                  << "profile_greedy_block_inclusive_scan_ms="
+                  << pd.greedy_block_inclusive_scan_ms << "\n"
+                  << "profile_greedy_scan_block_offsets_ms="
+                  << pd.greedy_scan_block_offsets_ms << "\n"
+                  << "profile_greedy_add_block_offset_ms="
+                  << pd.greedy_add_block_offset_ms << "\n"
+                  << "profile_greedy_rearrange_tracks_ms="
+                  << pd.greedy_rearrange_tracks_ms << "\n"
+                  << "profile_greedy_update_status_ms="
+                  << pd.greedy_update_status_ms << "\n"
                   << "profile_hash_match=" << (hash_match ? "true" : "false")
                   << "\n";
     }

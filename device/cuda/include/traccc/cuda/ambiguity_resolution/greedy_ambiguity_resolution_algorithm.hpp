@@ -36,7 +36,20 @@ struct gpu_profile_data_t {
     float eviction_loop_ms = 0.f;
     float output_copy_ms = 0.f;
     unsigned int eviction_graph_launches = 0u;
+    unsigned int eviction_graph_instantiations = 0u;
     unsigned int unique_meas_count = 0u;
+    /// Cumulative GPU time inside the greedy eviction graph body, measured
+    /// with cudaEvents on an eager (non-captured) path when
+    /// set_greedy_kernel_breakdown(true). Sums over outer iterations and inner
+    /// graph replays (same semantics as the captured baseline graph).
+    float greedy_remove_tracks_ms = 0.f;
+    float greedy_sort_updated_tracks_ms = 0.f;
+    float greedy_fill_inverted_ids_ms = 0.f;
+    float greedy_block_inclusive_scan_ms = 0.f;
+    float greedy_scan_block_offsets_ms = 0.f;
+    float greedy_add_block_offset_ms = 0.f;
+    float greedy_rearrange_tracks_ms = 0.f;
+    float greedy_update_status_ms = 0.f;
 };
 
 /// Evicts tracks that seem to be duplicates or fakes. This algorithm takes a
@@ -77,6 +90,12 @@ class greedy_ambiguity_resolution_algorithm
     /// Enable per-phase CUDA event timing for the next operator() call.
     void set_profiling(bool on) { m_profiling = on; }
 
+    /// When set with set_profiling(true), the baseline greedy path (no PBG,
+    /// no Tier-2c graph) runs eviction kernels eagerly and accumulates
+    /// per-kernel GPU times into last_profile() — CUDA graphs are not used
+    /// for that call.
+    void set_greedy_kernel_breakdown(bool on) { m_greedy_kernel_breakdown = on; }
+
     /// Returns profiling data from the most recent operator() call.
     /// Only valid after a call where set_profiling(true) was active.
     const gpu_profile_data_t& last_profile() const { return m_last_profile; }
@@ -115,6 +134,13 @@ class greedy_ambiguity_resolution_algorithm
     void set_batch_size_log(std::vector<unsigned int>* out) {
         m_batch_size_log = out;
     }
+
+    /// When enabled, the eviction-loop CUDA graph is captured once on the
+    /// first outer iteration and reused (with kernel-node parameter updates
+    /// via cudaGraphExecKernelNodeSetParams) on all subsequent iterations,
+    /// eliminating per-iteration cudaGraphInstantiate overhead.
+    /// Only effective for the baseline greedy path (no PBG, no conflict-graph).
+    void set_reuse_eviction_graph(bool on) { m_reuse_eviction_graph = on; }
 
     /// Tier 2c: algorithm selector for the explicit-conflict-graph path.
     ///   NONE      — disable explicit conflict graph (fall through to the
@@ -160,6 +186,7 @@ class greedy_ambiguity_resolution_algorithm
     /// Warp size of the GPU being used
     unsigned int m_warp_size;
     mutable bool m_profiling{false};
+    mutable bool m_greedy_kernel_breakdown{false};
     mutable gpu_profile_data_t m_last_profile{};
     unsigned int m_n_it_max{100u};
     bool m_adaptive_n_it{true};
@@ -167,6 +194,7 @@ class greedy_ambiguity_resolution_algorithm
     unsigned int m_parallel_batch_window{8192u};
     mutable std::vector<unsigned int>* m_batch_size_log{nullptr};
     graph_algo_t m_graph_algo{graph_algo_t::NONE};
+    bool m_reuse_eviction_graph{false};
     mutable std::vector<unsigned int>* m_graph_batch_log{nullptr};
     mutable std::vector<std::pair<unsigned int, unsigned int>>*
         m_graph_size_log{nullptr};

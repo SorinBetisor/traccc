@@ -60,7 +60,8 @@ std::vector<std::vector<traccc::measurement_id_type>> extract_sorted_patterns(
     traccc::edm::measurement_collection::const_device meas{out.measurements};
     for (std::size_t i = 0; i < out.tracks.size(); ++i) {
         std::vector<traccc::measurement_id_type> p;
-        for (const auto& [type, idx] : out.tracks.at(i).constituent_links()) {
+        const auto track = out.tracks.at(i);
+        for (const auto& [type, idx] : track.constituent_links()) {
             if (type == traccc::edm::track_constituent_link::measurement) {
                 p.push_back(meas.at(idx).identifier());
             }
