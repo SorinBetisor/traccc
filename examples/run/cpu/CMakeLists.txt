@@ -34,8 +34,12 @@ traccc_add_executable( seq_example "apps/seq_example.cpp"
    traccc::performance traccc::options detray::detectors detray::io
    traccc::examples_common )
 
+find_package( OpenMP )
 traccc_add_executable( benchmark_resolver "benchmark_resolver.cpp"
    LINK_LIBRARIES vecmem::core traccc::core traccc::io )
+if( OpenMP_CXX_FOUND )
+   target_link_libraries( traccc_benchmark_resolver PRIVATE OpenMP::OpenMP_CXX )
+endif()
 
 traccc_add_executable( tml_seed_count "tml_seed_count.cpp"
    LINK_LIBRARIES vecmem::core traccc::core traccc::io )

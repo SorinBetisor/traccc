@@ -291,6 +291,7 @@ int main(int argc, char* argv[]) {
     std::string log_graph_batches_path;
     std::size_t determinism_runs = 0;
     std::string truth_file;
+    std::size_t n_streams = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -345,6 +346,8 @@ int main(int argc, char* argv[]) {
             determinism_runs = std::stoull(arg.substr(19));
         } else if (arg.find("--truth-file=") == 0) {
             truth_file = arg.substr(13);
+        } else if (arg.find("--streams=") == 0) {
+            n_streams = std::stoull(arg.substr(10));
         } else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "benchmark_resolver_cuda: GPU greedy ambiguity resolver "
@@ -388,6 +391,10 @@ int main(int argc, char* argv[]) {
                    "  Truth file format: generated alongside Fatras dumps "
                    "from particles.csv + truth_hits.csv using the companion "
                    "script scripts/make_truth_file.py\n"
+                << "  --streams=N           Run N independent GPU resolvers on N\n"
+                << "                        CUDA streams concurrently on the same\n"
+                << "                        event and report aggregate throughput\n"
+                << "                        (events/sec). Default 0 = disabled.\n"
                 << "\nAdaptive n_it (default, no --n-it):\n"
                 << "  n_it per outer step = max(1, min(100, n_accepted/50))\n"
                 << "  Gives n=87 -> n_it~1, n=1000 -> n_it~10, n=10000 -> "
@@ -1054,6 +1061,105 @@ int main(int argc, char* argv[]) {
     if (baseline.n_selected != n_selected_cpu)
         std::cerr << "WARNING: GPU baseline selected " << baseline.n_selected
                   << " tracks but CPU selected " << n_selected_cpu << "\n";
+
+    // ------------------------------------------------------------------
+    // Multi-stream throughput (--streams=N)
+    // Creates N independent (stream, copy, resolver) triples that all
+    // operate on the same read-only device_input buffer.  All N resolvers
+    // are dispatched concurrently then synchronised; wall-clock time
+    // measures steady-state throughput at N events in flight.
+    // ------------------------------------------------------------------
+    if (n_streams > 1) {
+        // Choose the best available algorithm for the multi-stream run
+        // (JP if requested, otherwise baseline greedy).
+        const graph_algo_t ms_algo = run_graph_jp  ? graph_algo_t::JP_COLOR
+                                   : run_graph_mis ? graph_algo_t::LUBY_MIS
+                                                   : graph_algo_t::NONE;
+
+        struct StreamSlot {
+            std::unique_ptr<traccc::cuda::stream> cuda_stream;
+            std::unique_ptr<vecmem::cuda::async_copy> async_copy_ptr;
+            std::unique_ptr<traccc::cuda::greedy_ambiguity_resolution_algorithm>
+                resolver;
+        };
+
+        std::vector<StreamSlot> slots;
+        slots.reserve(n_streams);
+        for (std::size_t s = 0; s < n_streams; ++s) {
+            StreamSlot slot;
+            slot.cuda_stream = std::make_unique<traccc::cuda::stream>();
+            slot.async_copy_ptr = std::make_unique<vecmem::cuda::async_copy>(
+                slot.cuda_stream->cudaStream());
+            slot.resolver = std::make_unique<
+                traccc::cuda::greedy_ambiguity_resolution_algorithm>(
+                config, mr, *slot.async_copy_ptr, *slot.cuda_stream);
+            slot.resolver->set_n_it_max(n_it_max);
+            slot.resolver->set_adaptive_n_it(adaptive_n_it);
+            slot.resolver->set_conflict_graph_mode(ms_algo);
+            slots.push_back(std::move(slot));
+        }
+
+        // The main H2D of device_input is already synchronised above.
+        // device_input is read-only during operator() so all slots can
+        // share it safely once uploads are complete.
+
+        // Warmup
+        for (std::size_t w = 0; w < warmup; ++w) {
+            for (auto& s : slots)
+                (*s.resolver)(device_input);
+            for (auto& s : slots)
+                s.cuda_stream->synchronize();
+        }
+
+        std::vector<double> ms_throughputs;
+        ms_throughputs.reserve(repeats);
+        for (std::size_t r = 0; r < repeats; ++r) {
+            auto t0 = clk::now();
+            for (auto& s : slots)
+                (*s.resolver)(device_input);
+            for (auto& s : slots)
+                s.cuda_stream->synchronize();
+            const double wall_ms = ms_dur(clk::now() - t0).count();
+            ms_throughputs.push_back(
+                static_cast<double>(n_streams) * 1000.0 / wall_ms);
+        }
+
+        const double ms_mean_thr =
+            std::accumulate(ms_throughputs.begin(), ms_throughputs.end(), 0.0) /
+            static_cast<double>(repeats);
+
+        double ms_sum_sq = 0.0;
+        for (double t : ms_throughputs)
+            ms_sum_sq += (t - ms_mean_thr) * (t - ms_mean_thr);
+        const double ms_std_thr =
+            std::sqrt(ms_sum_sq / static_cast<double>(repeats));
+
+        std::vector<double> ms_thr_sorted = ms_throughputs;
+        std::nth_element(ms_thr_sorted.begin(),
+                         ms_thr_sorted.begin() +
+                             static_cast<std::ptrdiff_t>(repeats / 2),
+                         ms_thr_sorted.end());
+        const double ms_median_thr = ms_thr_sorted[repeats / 2];
+
+        const double single_stream_eps = 1000.0 / baseline.mean_ms;
+        const double ms_speedup = ms_mean_thr / single_stream_eps;
+
+        std::cout << "multi_stream_n=" << n_streams << "\n"
+                  << "multi_stream_algo="
+                  << (ms_algo == graph_algo_t::JP_COLOR    ? "graph_jp"
+                      : ms_algo == graph_algo_t::LUBY_MIS ? "graph_mis"
+                                                          : "baseline")
+                  << "\n"
+                  << "multi_stream_events_per_sec_mean=" << ms_mean_thr << "\n"
+                  << "multi_stream_events_per_sec_std=" << ms_std_thr << "\n"
+                  << "multi_stream_events_per_sec_median=" << ms_median_thr
+                  << "\n"
+                  << "multi_stream_effective_latency_ms="
+                  << (static_cast<double>(n_streams) * 1000.0 / ms_mean_thr)
+                  << "\n"
+                  << "multi_stream_speedup_vs_single_stream=" << ms_speedup
+                  << "\n";
+    }
     // Keep shims so the rest of the original output block (profile section)
     // below still compiles.
     const bool hash_match = baseline.hash_match;

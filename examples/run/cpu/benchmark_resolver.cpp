@@ -4,6 +4,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <iostream>
 #include <numeric>
@@ -16,6 +17,10 @@
 #include <vecmem/memory/host_memory_resource.hpp>
 #include <vecmem/utils/copy.hpp>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "traccc/ambiguity_resolution/ambiguity_resolution_config.hpp"
 #include "traccc/ambiguity_resolution/greedy_ambiguity_resolution_algorithm.hpp"
@@ -385,6 +390,7 @@ int main(int argc, char* argv[]) {
     std::size_t repeats = 10;
     std::size_t warmup = 3;
     bool profile = false;
+    std::size_t n_threads = 1;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -404,6 +410,8 @@ int main(int argc, char* argv[]) {
             warmup = std::stoull(arg.substr(9));
         } else if (arg == "--profile") {
             profile = true;
+        } else if (arg.find("--threads=") == 0) {
+            n_threads = std::stoull(arg.substr(10));
         } else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "benchmark_resolver: Resolver-only benchmark\n"
@@ -415,7 +423,10 @@ int main(int argc, char* argv[]) {
                 << "  --repeats=N           (default 10)\n"
                 << "  --warmup=N            (default 3)\n"
                 << "  --profile             Per-phase timing breakdown (1 "
-                   "warmup + 1 pass)\n";
+                   "warmup + 1 pass)\n"
+                << "  --threads=N           OpenMP parallel threads (default 1).\n"
+                << "                        Runs N*repeats events concurrently and\n"
+                << "                        reports wall-clock throughput (events/sec).\n";
             return 0;
         }
     }
@@ -546,6 +557,74 @@ int main(int argc, char* argv[]) {
               << "peak_memory_mb=" << peak_mb << "\n"
               << "output_hash=" << first_hash << "\n"
               << "duplicate_rate_post=" << last_dup_rate << "\n";
+
+    // ------------------------------------------------------------------
+    // OpenMP multi-threaded throughput (--threads=N)
+    // Runs N*repeats independent resolver calls concurrently across N
+    // threads, measuring wall-clock throughput in events/sec.
+    // ------------------------------------------------------------------
+    if (n_threads > 1) {
+#ifdef _OPENMP
+        using clk = std::chrono::high_resolution_clock;
+        using ms_dur = std::chrono::duration<double, std::milli>;
+        const int omp_n = static_cast<int>(n_threads);
+        const std::size_t total_work = repeats * n_threads;
+        std::vector<double> omp_per_ms(total_work, 0.0);
+        std::vector<std::size_t> omp_n_sel(n_threads, 0);
+
+        // Warmup (parallel)
+        #pragma omp parallel num_threads(omp_n)
+        {
+            vecmem::host_memory_resource thr_mr;
+            traccc::host::greedy_ambiguity_resolution_algorithm thr_res(config,
+                                                                        thr_mr);
+            #pragma omp for schedule(dynamic)
+            for (std::size_t w = 0; w < warmup * n_threads; ++w) {
+                thr_res(traccc::edm::track_container<
+                        traccc::default_algebra>::const_data(*input_tracks));
+            }
+        }
+
+        auto omp_wall_t0 = clk::now();
+        #pragma omp parallel num_threads(omp_n)
+        {
+            const std::size_t tid =
+                static_cast<std::size_t>(omp_get_thread_num());
+            vecmem::host_memory_resource thr_mr;
+            traccc::host::greedy_ambiguity_resolution_algorithm thr_res(config,
+                                                                        thr_mr);
+            #pragma omp for schedule(dynamic)
+            for (std::size_t w = 0; w < total_work; ++w) {
+                auto t0 = clk::now();
+                auto result = thr_res(
+                    traccc::edm::track_container<
+                        traccc::default_algebra>::const_data(*input_tracks));
+                omp_per_ms[w] = ms_dur(clk::now() - t0).count();
+                omp_n_sel[tid] = result.tracks.size();
+            }
+        }
+        const double omp_wall_ms =
+            ms_dur(clk::now() - omp_wall_t0).count();
+
+        const double omp_mean_per_event =
+            std::accumulate(omp_per_ms.begin(), omp_per_ms.end(), 0.0) /
+            static_cast<double>(total_work);
+        const double omp_events_per_sec =
+            static_cast<double>(total_work) * 1000.0 / omp_wall_ms;
+        const double single_events_per_sec = 1000.0 / mean_ms;
+
+        std::cout << "n_threads=" << n_threads << "\n"
+                  << "omp_n_selected=" << omp_n_sel[0] << "\n"
+                  << "omp_per_event_mean_ms=" << omp_mean_per_event << "\n"
+                  << "omp_wall_ms_total=" << omp_wall_ms << "\n"
+                  << "omp_events_per_sec=" << omp_events_per_sec << "\n"
+                  << "omp_speedup_vs_single_thread="
+                  << (omp_events_per_sec / single_events_per_sec) << "\n";
+#else
+        std::cerr << "WARNING: --threads=" << n_threads
+                  << " requested but this build has no OpenMP support\n";
+#endif
+    }
 
     if (profile) {
         // one warmup so caches are warm before the single profiling pass
