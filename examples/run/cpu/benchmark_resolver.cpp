@@ -4,6 +4,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <iostream>
 #include <numeric>
@@ -17,8 +18,14 @@
 #include <vecmem/utils/copy.hpp>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "traccc/ambiguity_resolution/ambiguity_resolution_config.hpp"
 #include "traccc/ambiguity_resolution/greedy_ambiguity_resolution_algorithm.hpp"
+#include "traccc/ambiguity_resolution/jp_ambiguity_resolution_algorithm.hpp"
+#include "traccc/ambiguity_resolution/score_based_ambiguity_resolution_algorithm.hpp"
 #include "traccc/edm/track_container.hpp"
 #include "traccc/io/ambiguity_io.hpp"
 
@@ -173,9 +180,8 @@ static PhaseTimingMs run_with_phase_timing(
     std::vector<std::size_t> n_meas(n_tracks, 0u);
 
     for (unsigned int i = 0; i < n_tracks; ++i) {
-        const auto track = input_tracks.tracks.at(i);
-        pvals[i] = track.pval();
-        const auto links = track.constituent_links();
+        pvals[i] = input_tracks.tracks.at(i).pval();
+        const auto links = input_tracks.tracks.at(i).constituent_links();
         const unsigned int n_cands = links.size();
         if (n_cands < config.min_meas_per_track) {
             const auto it =
@@ -386,6 +392,9 @@ int main(int argc, char* argv[]) {
     std::size_t repeats = 10;
     std::size_t warmup = 3;
     bool profile = false;
+    std::size_t n_threads = 1;
+    bool run_jp = false;
+    bool run_score_based = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -405,6 +414,19 @@ int main(int argc, char* argv[]) {
             warmup = std::stoull(arg.substr(9));
         } else if (arg == "--profile") {
             profile = true;
+        } else if (arg.find("--threads=") == 0) {
+            n_threads = std::stoull(arg.substr(10));
+        } else if (arg.find("--conflict-graph=") == 0) {
+            std::string v = arg.substr(17);
+            if (v == "jp") {
+                run_jp = true;
+            } else {
+                std::cerr << "unknown --conflict-graph value: " << v
+                          << " (CPU harness supports: jp)\n";
+                return 2;
+            }
+        } else if (arg == "--score-based" || arg == "--algo=score-based") {
+            run_score_based = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "benchmark_resolver: Resolver-only benchmark\n"
@@ -416,7 +438,12 @@ int main(int argc, char* argv[]) {
                 << "  --repeats=N           (default 10)\n"
                 << "  --warmup=N            (default 3)\n"
                 << "  --profile             Per-phase timing breakdown (1 "
-                   "warmup + 1 pass)\n";
+                   "warmup + 1 pass)\n"
+                << "  --threads=N           OpenMP parallel threads (default 1).\n"
+                << "                        Runs N*repeats events concurrently and\n"
+                << "                        reports wall-clock throughput (events/sec).\n"
+                << "  --conflict-graph=jp   Also run Jones-Plassmann resolver.\n"
+                << "  --score-based         Also run ACTS-style score-based resolver.\n";
             return 0;
         }
     }
@@ -538,7 +565,8 @@ int main(int argc, char* argv[]) {
     std::size_t n_input = input_tracks->tracks.size();
     double peak_mb = get_peak_rss_mb();
 
-    std::cout << "n_candidates=" << n_input << " n_selected=" << n_selected
+    std::cout << "backend=cpu_greedy\n"
+              << "n_candidates=" << n_input << " n_selected=" << n_selected
               << " n_removed=" << (n_input - n_selected) << "\n"
               << "time_ms_mean=" << mean_ms << " time_ms_std=" << std_ms
               << " time_ms_median=" << median_ms << " time_ms_p95=" << p95_ms
@@ -547,6 +575,242 @@ int main(int argc, char* argv[]) {
               << "peak_memory_mb=" << peak_mb << "\n"
               << "output_hash=" << first_hash << "\n"
               << "duplicate_rate_post=" << last_dup_rate << "\n";
+
+    // ------------------------------------------------------------------
+    // CPU JP single-thread run (--conflict-graph=jp)
+    // ------------------------------------------------------------------
+    if (run_jp) {
+        using clk_jp = std::chrono::high_resolution_clock;
+        using ms_jp  = std::chrono::duration<double, std::milli>;
+
+        traccc::host::jp_ambiguity_resolution_algorithm jp_resolver(config,
+                                                                    host_mr);
+        const auto cv =
+            traccc::edm::track_container<traccc::default_algebra>::const_data(
+                *input_tracks);
+
+        for (std::size_t w = 0; w < warmup; ++w) {
+            jp_resolver(cv);
+        }
+
+        std::vector<double> jp_times;
+        jp_times.reserve(repeats);
+        std::string jp_hash;
+        std::size_t jp_n_selected = 0;
+        double jp_dup_rate = 0.0;
+
+        for (std::size_t r = 0; r < repeats; ++r) {
+            auto t0 = clk_jp::now();
+            auto result = jp_resolver(cv);
+            jp_times.push_back(ms_jp(clk_jp::now() - t0).count());
+            jp_n_selected = result.tracks.size();
+            const auto pats = extract_sorted_patterns(result);
+            jp_dup_rate = duplicate_rate(pats);
+            const std::string h = compute_output_hash(result);
+            if (r == 0) {
+                jp_hash = h;
+            } else if (h != jp_hash) {
+                std::cerr << "WARNING: cpu_jp non-deterministic at repeat " << r
+                          << "\n";
+            }
+        }
+
+        const double jp_mean =
+            std::accumulate(jp_times.begin(), jp_times.end(), 0.0) /
+            static_cast<double>(repeats);
+        double jp_sq = 0;
+        for (double t : jp_times) jp_sq += (t - jp_mean) * (t - jp_mean);
+        const double jp_std = std::sqrt(jp_sq / static_cast<double>(repeats));
+        std::nth_element(jp_times.begin(),
+                         jp_times.begin() +
+                             static_cast<std::ptrdiff_t>(repeats / 2),
+                         jp_times.end());
+        const double jp_median = jp_times[repeats / 2];
+        std::size_t jp_p95_idx =
+            static_cast<std::size_t>(static_cast<double>(repeats) * 0.95);
+        if (jp_p95_idx >= repeats) jp_p95_idx = repeats - 1;
+        std::nth_element(jp_times.begin(),
+                         jp_times.begin() +
+                             static_cast<std::ptrdiff_t>(jp_p95_idx),
+                         jp_times.end());
+        const double jp_p95 = jp_times[jp_p95_idx];
+
+        std::cout << "backend=cpu_jp\n"
+                  << "jp_n_selected=" << jp_n_selected
+                  << " jp_n_removed=" << (n_input - jp_n_selected) << "\n"
+                  << "jp_time_ms_mean=" << jp_mean
+                  << " jp_time_ms_std=" << jp_std
+                  << " jp_time_ms_median=" << jp_median
+                  << " jp_time_ms_p95=" << jp_p95 << "\n"
+                  << "jp_events_per_sec=" << (1000.0 / jp_mean) << "\n"
+                  << "jp_output_hash=" << jp_hash << "\n"
+                  << "jp_hash_match=" << (jp_hash == first_hash ? "true" : "false")
+                  << "\n"
+                  << "jp_duplicate_rate_post=" << jp_dup_rate << "\n"
+                  << "jp_speedup_vs_greedy=" << (mean_ms / jp_mean) << "\n";
+    }
+
+    // ------------------------------------------------------------------
+    // CPU Score-Based single-thread run (--score-based / --algo=score-based)
+    // ------------------------------------------------------------------
+    if (run_score_based) {
+        using clk_sb = std::chrono::high_resolution_clock;
+        using ms_sb  = std::chrono::duration<double, std::milli>;
+
+        traccc::host::score_based_ambiguity_resolution_algorithm sb_resolver(
+            config, host_mr);
+        const auto cv =
+            traccc::edm::track_container<traccc::default_algebra>::const_data(
+                *input_tracks);
+
+        for (std::size_t w = 0; w < warmup; ++w) {
+            sb_resolver(cv);
+        }
+
+        std::vector<double> sb_times;
+        sb_times.reserve(repeats);
+        std::string sb_hash;
+        std::size_t sb_n_selected = 0;
+        double sb_dup_rate = 0.0;
+
+        for (std::size_t r = 0; r < repeats; ++r) {
+            auto t0 = clk_sb::now();
+            auto result = sb_resolver(cv);
+            sb_times.push_back(ms_sb(clk_sb::now() - t0).count());
+            sb_n_selected = result.tracks.size();
+            const auto pats = extract_sorted_patterns(result);
+            sb_dup_rate = duplicate_rate(pats);
+            const std::string h = compute_output_hash(result);
+            if (r == 0) {
+                sb_hash = h;
+            } else if (h != sb_hash) {
+                std::cerr << "WARNING: cpu_score_based non-deterministic at repeat "
+                          << r << "\n";
+            }
+        }
+
+        const double sb_mean =
+            std::accumulate(sb_times.begin(), sb_times.end(), 0.0) /
+            static_cast<double>(repeats);
+        double sb_sq = 0;
+        for (double t : sb_times) sb_sq += (t - sb_mean) * (t - sb_mean);
+        const double sb_std = std::sqrt(sb_sq / static_cast<double>(repeats));
+        std::nth_element(sb_times.begin(),
+                         sb_times.begin() +
+                             static_cast<std::ptrdiff_t>(repeats / 2),
+                         sb_times.end());
+        const double sb_median = sb_times[repeats / 2];
+        std::size_t sb_p95_idx =
+            static_cast<std::size_t>(static_cast<double>(repeats) * 0.95);
+        if (sb_p95_idx >= repeats) sb_p95_idx = repeats - 1;
+        std::nth_element(sb_times.begin(),
+                         sb_times.begin() +
+                             static_cast<std::ptrdiff_t>(sb_p95_idx),
+                         sb_times.end());
+        const double sb_p95 = sb_times[sb_p95_idx];
+
+        std::cout << "backend=cpu_score_based\n"
+                  << "sb_n_selected=" << sb_n_selected
+                  << " sb_n_removed=" << (n_input - sb_n_selected) << "\n"
+                  << "sb_time_ms_mean=" << sb_mean
+                  << " sb_time_ms_std=" << sb_std
+                  << " sb_time_ms_median=" << sb_median
+                  << " sb_time_ms_p95=" << sb_p95 << "\n"
+                  << "sb_events_per_sec=" << (1000.0 / sb_mean) << "\n"
+                  << "sb_output_hash=" << sb_hash << "\n"
+                  << "sb_hash_match=" << (sb_hash == first_hash ? "true" : "false")
+                  << "\n"
+                  << "sb_duplicate_rate_post=" << sb_dup_rate << "\n"
+                  << "sb_speedup_vs_greedy=" << (mean_ms / sb_mean) << "\n";
+    }
+
+    // ------------------------------------------------------------------
+    // OpenMP multi-threaded throughput (--threads=N)
+    // Runs N*repeats independent resolver calls concurrently across N
+    // threads, measuring wall-clock throughput in events/sec.
+    // ------------------------------------------------------------------
+    if (n_threads > 1) {
+#ifdef _OPENMP
+        using clk = std::chrono::high_resolution_clock;
+        using ms_dur = std::chrono::duration<double, std::milli>;
+        const int omp_n = static_cast<int>(n_threads);
+        const std::size_t total_work = repeats * n_threads;
+        std::vector<double> omp_per_ms(total_work, 0.0);
+        std::vector<std::size_t> omp_n_sel(n_threads, 0);
+
+        const std::string omp_algo_label = run_jp ? "cpu_jp" : "cpu_greedy";
+
+        // Warmup (parallel)
+        #pragma omp parallel num_threads(omp_n)
+        {
+            vecmem::host_memory_resource thr_mr;
+            traccc::host::greedy_ambiguity_resolution_algorithm thr_greedy(
+                config, thr_mr);
+            traccc::host::jp_ambiguity_resolution_algorithm thr_jp(config,
+                                                                   thr_mr);
+            #pragma omp for schedule(dynamic)
+            for (std::size_t w = 0; w < warmup * n_threads; ++w) {
+                if (run_jp) {
+                    thr_jp(traccc::edm::track_container<
+                           traccc::default_algebra>::const_data(*input_tracks));
+                } else {
+                    thr_greedy(
+                        traccc::edm::track_container<
+                            traccc::default_algebra>::const_data(*input_tracks));
+                }
+            }
+        }
+
+        auto omp_wall_t0 = clk::now();
+        #pragma omp parallel num_threads(omp_n)
+        {
+            const std::size_t tid =
+                static_cast<std::size_t>(omp_get_thread_num());
+            vecmem::host_memory_resource thr_mr;
+            traccc::host::greedy_ambiguity_resolution_algorithm thr_greedy(
+                config, thr_mr);
+            traccc::host::jp_ambiguity_resolution_algorithm thr_jp(config,
+                                                                   thr_mr);
+            const auto cv_omp =
+                traccc::edm::track_container<
+                    traccc::default_algebra>::const_data(*input_tracks);
+            #pragma omp for schedule(dynamic)
+            for (std::size_t w = 0; w < total_work; ++w) {
+                auto t0 = clk::now();
+                traccc::edm::track_container<traccc::default_algebra>::host
+                    result{thr_mr};
+                if (run_jp) {
+                    result = thr_jp(cv_omp);
+                } else {
+                    result = thr_greedy(cv_omp);
+                }
+                omp_per_ms[w] = ms_dur(clk::now() - t0).count();
+                omp_n_sel[tid] = result.tracks.size();
+            }
+        }
+        const double omp_wall_ms =
+            ms_dur(clk::now() - omp_wall_t0).count();
+
+        const double omp_mean_per_event =
+            std::accumulate(omp_per_ms.begin(), omp_per_ms.end(), 0.0) /
+            static_cast<double>(total_work);
+        const double omp_events_per_sec =
+            static_cast<double>(total_work) * 1000.0 / omp_wall_ms;
+        const double single_events_per_sec = 1000.0 / mean_ms;
+
+        std::cout << "omp_algo=" << omp_algo_label << "\n"
+                  << "n_threads=" << n_threads << "\n"
+                  << "omp_n_selected=" << omp_n_sel[0] << "\n"
+                  << "omp_per_event_mean_ms=" << omp_mean_per_event << "\n"
+                  << "omp_wall_ms_total=" << omp_wall_ms << "\n"
+                  << "omp_events_per_sec=" << omp_events_per_sec << "\n"
+                  << "omp_speedup_vs_single_thread="
+                  << (omp_events_per_sec / single_events_per_sec) << "\n";
+#else
+        std::cerr << "WARNING: --threads=" << n_threads
+                  << " requested but this build has no OpenMP support\n";
+#endif
+    }
 
     if (profile) {
         // one warmup so caches are warm before the single profiling pass

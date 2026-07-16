@@ -141,6 +141,10 @@ traccc_add_library( traccc_core core TYPE SHARED
   "include/traccc/ambiguity_resolution/ambiguity_resolution_config.hpp"
   "include/traccc/ambiguity_resolution/greedy_ambiguity_resolution_algorithm.hpp"
   "src/ambiguity_resolution/greedy_ambiguity_resolution_algorithm.cpp"
+  "include/traccc/ambiguity_resolution/jp_ambiguity_resolution_algorithm.hpp"
+  "src/ambiguity_resolution/jp_ambiguity_resolution_algorithm.cpp"
+  "include/traccc/ambiguity_resolution/score_based_ambiguity_resolution_algorithm.hpp"
+  "src/ambiguity_resolution/score_based_ambiguity_resolution_algorithm.cpp"
   "include/traccc/ambiguity_resolution/legacy/greedy_ambiguity_resolution_algorithm.hpp"
   "src/ambiguity_resolution/legacy/greedy_ambiguity_resolution_algorithm.cpp")
 target_link_libraries( traccc_core

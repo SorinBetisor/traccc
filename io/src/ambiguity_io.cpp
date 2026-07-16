@@ -29,6 +29,10 @@ void write_ambiguity_input_impl(
         edm::track_collection<default_algebra>::const_device::size_type;
 
     nlohmann::json j;
+    // Dump-format version. v1 = pval + measurement_ids only; v2 adds
+    // chi2, ndf, nholes per track so downstream score-based / ML
+    // baselines can consume the same file without re-running the pipeline.
+    j["version"] = 2;
     j["config"]["min_meas_per_track"] = config.min_meas_per_track;
     j["config"]["max_iterations"] = config.max_iterations;
     j["config"]["max_shared_meas"] = config.max_shared_meas;
@@ -60,6 +64,11 @@ void write_ambiguity_input_impl(
         const auto& tc = tracks.tracks.at(i);
         nlohmann::json track_json;
         track_json["pval"] = tc.pval();
+        // v2 enrichment: fit quality + hole count for score-based / ML
+        // baselines. Read side treats them as optional.
+        track_json["chi2"] = tc.chi2();
+        track_json["ndf"] = tc.ndf();
+        track_json["nholes"] = tc.nholes();
         track_json["measurement_ids"] = nlohmann::json::array();
         for (const auto& [type, meas_idx] : tc.constituent_links()) {
             if (type == edm::track_constituent_link::measurement) {
@@ -129,6 +138,14 @@ ambiguity_input_data read_ambiguity_input(std::string_view path,
         scalar pval = t["pval"].get<scalar>();
         result.tracks.tracks.resize(result.tracks.tracks.size() + 1u);
         result.tracks.tracks.pval().back() = pval;
+        // v2 optional fields — default to 0 when reading a v1 dump so
+        // existing benchmark paths keep working unchanged.
+        result.tracks.tracks.chi2().back() =
+            t.value("chi2", static_cast<scalar>(0));
+        result.tracks.tracks.ndf().back() =
+            t.value("ndf", static_cast<scalar>(0));
+        result.tracks.tracks.nholes().back() =
+            t.value("nholes", 0u);
         for (const auto& mid : t["measurement_ids"]) {
             measurement_id_type id = mid.get<measurement_id_type>();
             auto it = id_to_idx.find(id);

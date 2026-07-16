@@ -10,6 +10,7 @@
 #include "traccc/utils/pair.hpp"
 
 // Local include(s).
+#include "../ambiguity_tuning.hpp"
 #include "../../utils/barrier.hpp"
 #include "../../utils/global_index.hpp"
 #include "remove_tracks.cuh"
@@ -168,7 +169,10 @@ __launch_bounds__(512) __global__
     unsigned int n_m = 0;
     if (gid >= 0) {
         trk_id = sorted_ids[gid];
-        n_m = n_meas[trk_id];
+        // GB-3: n_meas[] is read-only and accessed at a scattered trk_id.
+        // __ldg routes through the read-only data cache, reducing L1 pressure
+        // for this out-of-order gather.
+        n_m = traccc::cuda::tuning::tuned_ldg(n_meas.data() + trk_id);
 
         // Buffer for the number of measurement per track
         sh_buffer[threadIndex] = n_m;
@@ -194,8 +198,12 @@ __launch_bounds__(512) __global__
         const unsigned int pos = atomicAdd(&n_meas_total, n_m);
 
         const auto& mids = meas_ids[trk_id];
+        const auto* mids_ptr = mids.data();
         for (int i = 0; i < n_m; i++) {
-            sh_meas_ids[pos + i] = mids[i];
+            // GB-3: measurement IDs are read-only; __ldg uses the read-only
+            // cache path for this scattered jagged-array gather.
+            sh_meas_ids[pos + i] =
+                traccc::cuda::tuning::tuned_ldg(mids_ptr + i);
             sh_threads[pos + i] = threadIndex;
         }
     }
@@ -268,7 +276,11 @@ __launch_bounds__(512) __global__
         auto mid = sh_meas_ids[threadIndex];
         bool is_start =
             (threadIndex == 0) || (sh_meas_ids[threadIndex - 1] != mid);
-        const auto unique_meas_idx = meas_id_to_unique_id.at(mid);
+        // GB-3: meas_id_to_unique_id is read-only; after the bitonic sort
+        // sh_meas_ids is ascending so consecutive threads fetch ascending
+        // (near-sequential) indices — __ldg improves cache reuse here.
+        const auto unique_meas_idx =
+            traccc::cuda::tuning::tuned_ldg(meas_id_to_unique_id.data() + mid);
         const auto its_accepted_tracks =
             n_accepted_tracks_per_measurement.at(unique_meas_idx);
 
@@ -518,9 +530,11 @@ __launch_bounds__(512) __global__
             updated_tracks[pos2] = alive_trk_id;
             is_updated[alive_trk_id] = 1;
 
+            // GB-3: both n_shared and n_meas are read-only at this point.
             rel_shared.at(alive_trk_id) = math::div_ieee754(
                 static_cast<traccc::scalar>(n_shared.at(alive_trk_id)),
-                static_cast<traccc::scalar>(n_meas.at(alive_trk_id)));
+                static_cast<traccc::scalar>(traccc::cuda::tuning::tuned_ldg(
+                    n_meas.data() + alive_trk_id)));
         }
     }
 }

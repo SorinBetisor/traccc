@@ -21,7 +21,10 @@
 //          n_updated_tracks ≤ 32 the entire sort runs via __shfl_xor_sync
 //          (zero __syncthreads, all in registers), eliminating shared-mem
 //          traffic for the common convergence-phase invocations.
-//   GB-3  [planned] 96 KB dynamic smem in remove_tracks, bound 512→1024.
+//   GB-3  Read-only cache hints (__ldg) on scattered global reads in
+//          remove_tracks: n_meas[trk_id], mids[i], meas_id_to_unique_id[mid],
+//          and n_meas[alive_trk_id].  Theoretically reduces L1 pressure for
+//          out-of-order gathers; empirically benchmarked for honest comparison.
 
 #pragma once
 
