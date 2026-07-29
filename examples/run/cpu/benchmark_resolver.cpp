@@ -385,6 +385,7 @@ static PhaseTimingMs run_with_phase_timing(
 
 int main(int argc, char* argv[]) {
     std::string input_dump;
+    std::string input_dumps_csv;
     bool synthetic = false;
     std::size_t n_candidates = 10000;
     std::string conflict_density = "med";
@@ -400,6 +401,8 @@ int main(int argc, char* argv[]) {
         std::string arg = argv[i];
         if (arg.find("--input-dump=") == 0) {
             input_dump = arg.substr(13);
+        } else if (arg.find("--input-dumps=") == 0) {
+            input_dumps_csv = arg.substr(14);
         } else if (arg == "--synthetic") {
             synthetic = true;
         } else if (arg.find("--n-candidates=") == 0) {
@@ -461,9 +464,25 @@ int main(int argc, char* argv[]) {
         &track_candidates;
 
     std::optional<traccc::io::ambiguity_input_data> dump_data;
+    // Extra inputs for the mixed-workload OpenMP mode (--input-dumps=a,b,c).
+    std::vector<traccc::io::ambiguity_input_data> multi_dump_data;
     std::optional<traccc::edm::measurement_collection::host>
         synthetic_measurements;
-    if (!input_dump.empty()) {
+    if (!input_dumps_csv.empty()) {
+        std::stringstream ss(input_dumps_csv);
+        std::string path;
+        while (std::getline(ss, path, ',')) {
+            if (path.empty()) continue;
+            multi_dump_data.push_back(
+                traccc::io::read_ambiguity_input(path, host_mr));
+        }
+        if (multi_dump_data.empty()) {
+            std::cerr << "--input-dumps given but no paths parsed\n";
+            return 1;
+        }
+        input_tracks = &multi_dump_data.front().tracks;
+        config = multi_dump_data.front().config;
+    } else if (!input_dump.empty()) {
         dump_data = traccc::io::read_ambiguity_input(input_dump, host_mr);
         input_tracks = &dump_data->tracks;
         config = dump_data->config;
@@ -740,6 +759,26 @@ int main(int argc, char* argv[]) {
 
         const std::string omp_algo_label = run_jp ? "cpu_jp" : "cpu_greedy";
 
+        // Mixed-workload support: with --input-dumps the work queue draws
+        // from several events, assigned by a deterministic shuffle (seed 42).
+        std::vector<const traccc::edm::track_container<
+            traccc::default_algebra>::host*> omp_inputs;
+        if (!multi_dump_data.empty()) {
+            for (auto& d : multi_dump_data) {
+                omp_inputs.push_back(&d.tracks);
+            }
+        } else {
+            omp_inputs.push_back(input_tracks);
+        }
+        std::vector<std::size_t> item_input(total_work);
+        for (std::size_t w = 0; w < total_work; ++w) {
+            item_input[w] = w % omp_inputs.size();
+        }
+        {
+            std::mt19937 shuffle_rng(42);
+            std::shuffle(item_input.begin(), item_input.end(), shuffle_rng);
+        }
+
         // Warmup (parallel)
         #pragma omp parallel num_threads(omp_n)
         {
@@ -748,15 +787,22 @@ int main(int argc, char* argv[]) {
                 config, thr_mr);
             traccc::host::jp_ambiguity_resolution_algorithm thr_jp(config,
                                                                    thr_mr);
-            #pragma omp for schedule(dynamic)
+            using cv_type = decltype(traccc::edm::track_container<
+                traccc::default_algebra>::const_data(*input_tracks));
+            std::vector<cv_type> cvs;
+            cvs.reserve(omp_inputs.size());
+            for (const auto* p : omp_inputs) {
+                cvs.push_back(traccc::edm::track_container<
+                    traccc::default_algebra>::const_data(*p));
+            }
+            // schedule(runtime): policy picked via OMP_SCHEDULE env var
+            #pragma omp for schedule(runtime)
             for (std::size_t w = 0; w < warmup * n_threads; ++w) {
+                const auto& cv = cvs[item_input[w % total_work]];
                 if (run_jp) {
-                    thr_jp(traccc::edm::track_container<
-                           traccc::default_algebra>::const_data(*input_tracks));
+                    thr_jp(cv);
                 } else {
-                    thr_greedy(
-                        traccc::edm::track_container<
-                            traccc::default_algebra>::const_data(*input_tracks));
+                    thr_greedy(cv);
                 }
             }
         }
@@ -771,18 +817,23 @@ int main(int argc, char* argv[]) {
                 config, thr_mr);
             traccc::host::jp_ambiguity_resolution_algorithm thr_jp(config,
                                                                    thr_mr);
-            const auto cv_omp =
-                traccc::edm::track_container<
-                    traccc::default_algebra>::const_data(*input_tracks);
-            #pragma omp for schedule(dynamic)
+            using cv_type = decltype(traccc::edm::track_container<
+                traccc::default_algebra>::const_data(*input_tracks));
+            std::vector<cv_type> cvs;
+            cvs.reserve(omp_inputs.size());
+            for (const auto* p : omp_inputs) {
+                cvs.push_back(traccc::edm::track_container<
+                    traccc::default_algebra>::const_data(*p));
+            }
+            #pragma omp for schedule(runtime)
             for (std::size_t w = 0; w < total_work; ++w) {
                 auto t0 = clk::now();
                 traccc::edm::track_container<traccc::default_algebra>::host
                     result{thr_mr};
                 if (run_jp) {
-                    result = thr_jp(cv_omp);
+                    result = thr_jp(cvs[item_input[w]]);
                 } else {
-                    result = thr_greedy(cv_omp);
+                    result = thr_greedy(cvs[item_input[w]]);
                 }
                 omp_per_ms[w] = ms_dur(clk::now() - t0).count();
                 omp_n_sel[tid] = result.tracks.size();
@@ -799,6 +850,7 @@ int main(int argc, char* argv[]) {
         const double single_events_per_sec = 1000.0 / mean_ms;
 
         std::cout << "omp_algo=" << omp_algo_label << "\n"
+                  << "omp_n_inputs=" << omp_inputs.size() << "\n"
                   << "n_threads=" << n_threads << "\n"
                   << "omp_n_selected=" << omp_n_sel[0] << "\n"
                   << "omp_per_event_mean_ms=" << omp_mean_per_event << "\n"
